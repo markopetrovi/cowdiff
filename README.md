@@ -64,7 +64,14 @@ passing quietly.
 
     cowdiff [options] FILE1 FILE2
 
+    With -r, FILE1 and FILE2 may be directories; entries are visited in
+    sorted order, a name present on only one side is reported as
+    "Only in DIR: NAME", and each file that differs is introduced with the
+    "diff -ru A B" line diff prints.  Symlinks are followed, as diff does by
+    default, so a broken one is an error rather than a difference.
+
       -q, --brief          report only whether the files differ
+      -r, --recursive      compare directories recursively
           --stats          report how much was actually read
           --byte-offsets   put byte offsets in hunk headers instead of line
                            numbers, which skips the scan line numbers need

@@ -120,6 +120,30 @@ def differing(a, b):
     return merged
 
 
+def filefrag_flags(path):
+    """Raw kernel flags, from filefrag.
+
+    This is deliberately a second, independent source.  --dump-extents
+    reports what cowdiff concluded, faithfully -- which means it cannot
+    catch a wrong conclusion, only a stale one.  Asserting a kernel fact
+    alongside the verdict is what makes a wrong rule detectable.
+
+    -s syncs first, and it is not optional: without it filefrag reports a
+    freshly written file as a single DELALLOC extent with a meaningless
+    address, while cowdiff asks the kernel with FIEMAP_FLAG_SYNC and sees
+    the real extent.  Two views of the same file only agree once both are
+    looking at what is actually on disk.
+    """
+    r = subprocess.run(["filefrag", "-s", "-v", path], capture_output=True,
+                       text=True)
+    flags = set()
+    for line in r.stdout.splitlines():
+        parts = line.split(":")
+        if len(parts) >= 5 and parts[0].strip().isdigit():
+            flags.update(x.strip() for x in parts[-1].split(",") if x.strip())
+    return flags
+
+
 def bytes_read(err):
     m = re.search(rb"read (\d+) of", err)
     return int(m.group(1)) if m else None
@@ -190,8 +214,15 @@ def case_compressed():
         f.seek(16000000)
         f.write(b"CHANGED-CHANGED-CHANGED")
 
-    if not any("encoded" in e["flags"] for e in extents(a)):
+    if "encoded" not in filefrag_flags(a):
         raise Skip("filesystem did not compress the fixture")
+
+    # The kernel says compressed; cowdiff must still trust the address,
+    # since address and length together name the extent exactly.
+    enc = [e for e in extents(a) if "encoded" in e["flags"]]
+    check("%s: compressed extents are still trusted" % name,
+          bool(enc) and all(not e["flags"].startswith("untrusted")
+                            for e in enc), enc[:1])
 
     rc, out, _ = cow("--force-binary", a, b)
     regions = parse_regions(out)
@@ -284,8 +315,18 @@ def case_inline():
     with open(b, "wb") as f:
         f.write(b"HELLO WORLD\n")
 
-    if not any(e["flags"].startswith("untrusted") for e in extents(a)):
+    # Two independent facts that must agree.  filefrag reports what the
+    # kernel said; the dump reports what cowdiff concluded.  If the trust
+    # rule ever stopped treating inline data as untrusted, the first would
+    # still say inline while the second said trusted, and this would fail --
+    # which is exactly the bug that would make two different small files
+    # come out identical.
+    if "inline" not in filefrag_flags(a):
         raise Skip("the fixture was not stored inline")
+
+    check("%s: cowdiff refuses to trust an inline address" % name,
+          all(e["flags"].startswith("untrusted") for e in extents(a)),
+          extents(a))
 
     rc, out, err = cow("--force-binary", a, b)
     check("%s: different, not assumed equal" % name, rc == 1, rc)

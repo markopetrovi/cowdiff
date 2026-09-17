@@ -15,7 +15,7 @@
 #include <linux/fiemap.h>
 
 static bool opt_brief, opt_stats, opt_force_binary, opt_force_text;
-static bool opt_byte_offsets, opt_dump;
+static bool opt_byte_offsets, opt_recursive, opt_dump;
 
 static void usage(FILE *f, const char *argv0)
 {
@@ -33,6 +33,7 @@ static void usage(FILE *f, const char *argv0)
 "      --byte-offsets    put byte offsets in hunk headers instead of line\n"
 "                        numbers; skips the scan that line numbers need, at\n"
 "                        the cost of output that patch(1) cannot consume\n"
+"  -r, --recursive       compare directories recursively\n"
 "  -a, --text            treat the files as text even if they look binary\n"
 "      --force-binary    report byte ranges even if they look like text\n"
 "  -U NUM                lines of context around each change (default 3)\n"
@@ -85,7 +86,7 @@ static int open_map(const char *path, struct extmap *m, int *fd_out,
 		return -1;
 	}
 	if (S_ISDIR(st->st_mode)) {
-		fprintf(stderr, "cowdiff: %s: is a directory\n", path);
+		fprintf(stderr, "cowdiff: %s: is a directory (use -r)\n", path);
 		close(fd);
 		return -1;
 	}
@@ -116,7 +117,7 @@ static int dump_one(const char *path)
 	return 0;
 }
 
-static int compare(const char *pa, const char *pb)
+int compare_files(const char *pa, const char *pb, bool in_recursion)
 {
 	struct extmap ma, mb;
 	struct anchorlist al;
@@ -167,7 +168,9 @@ static int compare(const char *pa, const char *pb)
 	}
 
 	if (dl.n == 0) {
-		printf("Files %s and %s are identical\n", pa, pb);
+		/* diff -r says nothing about files that match. */
+		if (!in_recursion)
+			printf("Files %s and %s are identical\n", pa, pb);
 		rc = 0;
 		goto stats;
 	}
@@ -177,6 +180,11 @@ static int compare(const char *pa, const char *pb)
 		rc = 1;
 		goto stats;
 	}
+
+	/* diff -r names each file before reporting on it.  We only have one
+	 * output format, so the line always says -ru. */
+	if (in_recursion)
+		printf("diff -ru %s %s\n", pa, pb);
 
 	if (opt_force_binary || (!opt_force_text && (is_binary(fd_a) ||
 						     is_binary(fd_b)))) {
@@ -250,6 +258,8 @@ int main(int argc, char **argv)
 			opt_byte_offsets = true;
 		} else if (!strcmp(a, "-a") || !strcmp(a, "--text")) {
 			opt_force_text = true;
+		} else if (!strcmp(a, "-r") || !strcmp(a, "--recursive")) {
+			opt_recursive = true;
 		} else if (!strcmp(a, "--dump-extents")) {
 			opt_dump = true;
 		} else if (!strcmp(a, "-u") || !strcmp(a, "--unified")) {
@@ -301,5 +311,15 @@ int main(int argc, char **argv)
 	if (opt_dump && !pb)
 		return dump_one(pa);
 
-	return compare(pa, pb);
+	if (opt_recursive) {
+		struct stat sa, sb;
+
+		/* -r on two plain files is just a comparison; diff agrees. */
+		if (stat(pa, &sa) == 0 && stat(pb, &sb) == 0 &&
+		    S_ISREG(sa.st_mode) && S_ISREG(sb.st_mode))
+			return compare_files(pa, pb, false);
+		return walk_trees(pa, pb);
+	}
+
+	return compare_files(pa, pb, false);
 }

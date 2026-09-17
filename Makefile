@@ -2,7 +2,8 @@ CC      ?= cc
 CFLAGS  ?= -O2 -Wall -Wextra -std=gnu11
 PREFIX  ?= /usr/local
 
-SRC = src/main.c src/extmap.c src/anchor.c src/delta.c src/linediff.c src/output.c
+SRC = src/main.c src/extmap.c src/anchor.c src/delta.c src/linediff.c \
+      src/output.c src/walk.c
 OBJ = $(SRC:.c=.o)
 
 all: cowdiff tests/probe

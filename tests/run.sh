@@ -144,6 +144,35 @@ for opt in -u --unified -a --text; do
 	fi
 done
 
+# --- recursive (-r) ---------------------------------------------------------
+mkdir -p R1/sub R2/sub
+echo a > R1/f1;             echo b > R2/f1
+echo same > R1/same;        echo same > R2/same
+echo only > R1/extra
+echo x > R1/sub/deep;       echo y > R2/sub/deep
+echo z > R1/sub/only1
+
+LC_ALL=C diff -ru R1 R2 |
+	sed -e 's/^\(---\|+++\) \([^\t]*\)\t.*/\1 \2/' > "$WORK/.expected"
+"$COW" -r R1 R2 > "$WORK/.actual"
+if cmp -s "$WORK/.expected" "$WORK/.actual"; then
+	pass=$((pass + 1))
+else
+	fail=$((fail + 1))
+	echo "FAIL: -r output differs from diff -ru"
+	diff -u "$WORK/.expected" "$WORK/.actual" | head -30
+fi
+
+# -r on two identical trees must report nothing and succeed.
+rm -rf R3; cp -r R1 R3
+"$COW" -r R1 R3 > "$WORK/.actual" 2>&1
+rc=$?
+if [ -s "$WORK/.actual" ] || [ "$rc" -ne 0 ]; then
+	fail=$((fail + 1)); echo "FAIL: -r on identical trees (status $rc)"
+else
+	pass=$((pass + 1))
+fi
+
 # --- byte-offset mode -------------------------------------------------------
 # The bodies must match the line-number form exactly, and every hunk's offsets
 # must point at the content that hunk shows.

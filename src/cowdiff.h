@@ -192,6 +192,19 @@ int emit_text_diff(const char *path_a, const char *path_b, int fd_a, int fd_b,
 /* Is this file binary?  Follows diff(1): a NUL byte in the first block. */
 bool is_binary(int fd);
 
+/* ---- recursive comparison --------------------------------------------- */
+
+/*
+ * Compare two regular files, printing the result.  Returns 0 identical,
+ * 1 different, 2 error.  `in_recursion` suppresses the "are identical" line
+ * and prints the "diff -ru A B" header that diff -r puts before each file it
+ * reports on.
+ */
+int compare_files(const char *pa, const char *pb, bool in_recursion);
+
+/* Recursively compare two directory trees.  Returns 0/1/2. */
+int walk_trees(const char *pa, const char *pb);
+
 /* ---- line diff -------------------------------------------------------- */
 
 /* One line, including its trailing newline when it has one. */
