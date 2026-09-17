@@ -179,9 +179,15 @@ int range_is_zero(int fd, const struct extmap *m, uint64_t off, uint64_t len,
 
 int emit_binary_diff(const char *path_a, const char *path_b,
 		     const struct deltalist *dl);
+/*
+ * `byte_offsets` puts byte offsets in the hunk headers instead of line
+ * numbers.  The body is identical either way; the difference is that line
+ * numbers have to be counted from the start of the file, which costs a full
+ * pass over both files, while byte offsets are already known.
+ */
 int emit_text_diff(const char *path_a, const char *path_b, int fd_a, int fd_b,
 		   const struct extmap *ma, const struct extmap *mb,
-		   const struct deltalist *dl);
+		   const struct deltalist *dl, bool byte_offsets);
 
 /* Is this file binary?  Follows diff(1): a NUL byte in the first block. */
 bool is_binary(int fd);

@@ -117,6 +117,28 @@ chk "identical reflink" A.txt A2.txt
 mk B.txt; sed -i '1500i\inserted A\ninserted B\ninserted C' B.txt
 chk "three lines inserted" A.txt B.txt
 
+# --- byte-offset mode -------------------------------------------------------
+# The bodies must match the line-number form exactly, and every hunk's offsets
+# must point at the content that hunk shows.
+seq 1 500 | sed 's/^/line /' > P.txt
+mkr() { cp --reflink=always P.txt "$1"; }
+
+mkr Q.txt; sed -i '250s/.*/changed/' Q.txt
+mkr R.txt; sed -i '10d' R.txt
+mkr S.txt; sed -i '400i\inserted' S.txt
+mkr V.txt; sed -i '1s/.*/first/' V.txt; sed -i '$s/.*/last/' V.txt
+printf 'a\nb\nc' > T1.txt; printf 'a\nb\nd' > T2.txt
+seq 1 400 | sed 's/^/x /' > U1.txt; sed 's/x /y /' U1.txt > U2.txt
+
+echo "--- byte-offset mode ---"
+if python3 "$ROOT/tests/bytecheck.py" "$COW" \
+	P.txt Q.txt P.txt R.txt P.txt S.txt P.txt V.txt \
+	T1.txt T2.txt U1.txt U2.txt; then
+	pass=$((pass + 1))
+else
+	fail=$((fail + 1))
+fi
+
 rm -f "$WORK"/.expected "$WORK"/.actual "$WORK"/.err
 echo
 echo "passed $pass, failed $fail"

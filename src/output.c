@@ -255,6 +255,28 @@ static uint64_t ls_off(const struct lineset *ls, uint64_t base, size_t i)
 	return i < ls->n ? base + ls->v[i].boff : base + ls->buflen;
 }
 
+/* Emit the lines of a hunk: context, removals, insertions, context. */
+static int print_hunk_body(int fd_a, int fd_b, const struct beditlist *bl,
+			   size_t first, size_t last, uint64_t a_lo,
+			   uint64_t a_hi)
+{
+	uint64_t cursor = a_lo;
+	size_t i;
+
+	for (i = first; i <= last; i++) {
+		const struct bedit *e = &bl->v[i];
+
+		if (print_lines(fd_a, cursor, e->a_off, ' ') < 0)
+			return -1;
+		if (print_lines(fd_a, e->a_off, e->a_end, '-') < 0)
+			return -1;
+		if (print_lines(fd_b, e->b_off, e->b_end, '+') < 0)
+			return -1;
+		cursor = e->a_end;
+	}
+	return print_lines(fd_a, cursor, a_hi, ' ');
+}
+
 static bool ends_with_newline(int fd, uint64_t off)
 {
 	unsigned char c;
@@ -274,7 +296,6 @@ static int emit_hunk(int fd_a, int fd_b, uint64_t size_a,
 	uint64_t a_lo, a_hi, b_lo, b_hi;
 	uint64_t old_start, old_count, new_start, new_count;
 	unsigned int back = 0, fwd = 0;
-	size_t i;
 
 	if (rewind_lines(fd_a, e0->a_off, CONTEXT, &a_lo, &back) < 0)
 		return -1;
@@ -314,30 +335,84 @@ static int emit_hunk(int fd_a, int fd_b, uint64_t size_a,
 		printf(",%llu", (unsigned long long)new_count);
 	printf(" @@\n");
 
-	{
-		uint64_t cursor = a_lo;
+	return print_hunk_body(fd_a, fd_b, bl, first, last, a_lo, a_hi);
+}
 
-		for (i = first; i <= last; i++) {
-			const struct bedit *e = &bl->v[i];
+/*
+ * The same hunk, but the header carries byte offsets instead of line numbers.
+ *
+ * Line numbers are the only reason the text path has to read anything at all
+ * once the extent map has proven most of the file equal: a line number is a
+ * count of newlines from the start of the file, so producing one costs a pass
+ * over the whole thing.  A caller that does not need them keeps the entire
+ * benefit of knowing which bytes are shared.
+ *
+ * Both numbers are always printed, including a zero length, because unlike
+ * the line form there is no "count of one may be omitted" convention to lean
+ * on and a bare offset would read as a line number.
+ */
+static int emit_hunk_bytes(int fd_a, int fd_b, uint64_t size_a,
+			   const struct beditlist *bl, size_t first,
+			   size_t last)
+{
+	const struct bedit *e0 = &bl->v[first];
+	const struct bedit *e1 = &bl->v[last];
+	uint64_t a_lo, a_hi, b_lo, b_hi;
+	unsigned int back = 0, fwd = 0;
 
-			if (print_lines(fd_a, cursor, e->a_off, ' ') < 0)
-				return -1;
-			if (print_lines(fd_a, e->a_off, e->a_end, '-') < 0)
-				return -1;
-			if (print_lines(fd_b, e->b_off, e->b_end, '+') < 0)
-				return -1;
-			cursor = e->a_end;
-		}
-		if (print_lines(fd_a, cursor, a_hi, ' ') < 0)
-			return -1;
+	if (rewind_lines(fd_a, e0->a_off, CONTEXT, &a_lo, &back) < 0)
+		return -1;
+	if (forward_lines(fd_a, e1->a_end, size_a, CONTEXT, &a_hi, &fwd) < 0)
+		return -1;
+
+	b_lo = e0->b_off - (e0->a_off - a_lo);
+	b_hi = e1->b_end + (a_hi - e1->a_end);
+
+	printf("@@ -%llu,%llu +%llu,%llu @@\n", (unsigned long long)a_lo,
+	       (unsigned long long)(a_hi - a_lo), (unsigned long long)b_lo,
+	       (unsigned long long)(b_hi - b_lo));
+
+	return print_hunk_body(fd_a, fd_b, bl, first, last, a_lo, a_hi);
+}
+
+/*
+ * Would two edits be close enough to share a hunk?  In line mode that is a
+ * subtraction of two line numbers, which only exist after the whole-file
+ * scan.  Here the same question is answered by counting the newlines in the
+ * equal region between them and giving up as soon as there are too many --
+ * and giving up on bytes scanned as well, so that a region with no newlines
+ * in it at all cannot turn into an unbounded read.
+ */
+#define GAP_SCAN_BUDGET (1u << 20)
+
+static bool gap_is_close(int fd, uint64_t from, uint64_t to)
+{
+	unsigned char buf[4096];
+	uint64_t p = from, spent = 0;
+	unsigned int nl = 0;
+
+	while (p < to && spent < GAP_SCAN_BUDGET) {
+		uint64_t want = to - p;
+		uint64_t i;
+
+		if (want > sizeof buf)
+			want = sizeof buf;
+		if (want > GAP_SCAN_BUDGET - spent)
+			want = GAP_SCAN_BUDGET - spent;
+		if (pread_full(fd, buf, want, p) < 0)
+			return false;
+		for (i = 0; i < want; i++)
+			if (buf[i] == '\n' && ++nl > 2 * CONTEXT)
+				return false;
+		p += want;
+		spent += want;
 	}
-
-	return 0;
+	return p >= to;
 }
 
 int emit_text_diff(const char *path_a, const char *path_b, int fd_a, int fd_b,
 		   const struct extmap *ma, const struct extmap *mb,
-		   const struct deltalist *dl)
+		   const struct deltalist *dl, bool byte_offsets)
 {
 	struct beditlist bl;
 	struct lcounter ca, cb;
@@ -414,16 +489,21 @@ int emit_text_diff(const char *path_a, const char *path_b, int fd_a, int fd_b,
 		goto out;
 	}
 
-	/*
-	 * Line numbers, in one forward pass per file.  Edits are in order and
-	 * do not overlap, so the counter never has to go backwards.
-	 */
-	for (i = 0; i < bl.n; i++) {
-		if (lc_count(&ca, bl.v[i].a_off, &bl.v[i].a_line) < 0 ||
-		    lc_count(&ca, bl.v[i].a_end, &bl.v[i].a_end_line) < 0 ||
-		    lc_count(&cb, bl.v[i].b_off, &bl.v[i].b_line) < 0 ||
-		    lc_count(&cb, bl.v[i].b_end, &bl.v[i].b_end_line) < 0)
-			goto out;
+	if (!byte_offsets) {
+		/*
+		 * Line numbers, in one forward pass per file.  Edits are in
+		 * order and do not overlap, so the counter never has to go
+		 * backwards.  This is the pass that byte offsets avoid.
+		 */
+		for (i = 0; i < bl.n; i++) {
+			if (lc_count(&ca, bl.v[i].a_off, &bl.v[i].a_line) < 0 ||
+			    lc_count(&ca, bl.v[i].a_end,
+				     &bl.v[i].a_end_line) < 0 ||
+			    lc_count(&cb, bl.v[i].b_off, &bl.v[i].b_line) < 0 ||
+			    lc_count(&cb, bl.v[i].b_end,
+				     &bl.v[i].b_end_line) < 0)
+				goto out;
+		}
 	}
 
 	/*
@@ -434,9 +514,16 @@ int emit_text_diff(const char *path_a, const char *path_b, int fd_a, int fd_b,
 	for (i = 0; i <= bl.n; i++) {
 		bool flush = (i == bl.n);
 
-		if (i > first && i < bl.n &&
-		    bl.v[i].a_line - bl.v[i - 1].a_end_line > 2 * CONTEXT)
-			flush = true;
+		if (i > first && i < bl.n) {
+			if (byte_offsets) {
+				if (!gap_is_close(fd_a, bl.v[i - 1].a_end,
+						  bl.v[i].a_off))
+					flush = true;
+			} else if (bl.v[i].a_line - bl.v[i - 1].a_end_line >
+				   2 * CONTEXT) {
+				flush = true;
+			}
+		}
 
 		if (!flush)
 			continue;
@@ -445,9 +532,16 @@ int emit_text_diff(const char *path_a, const char *path_b, int fd_a, int fd_b,
 			printf("--- %s\n+++ %s\n", path_a, path_b);
 			header_done = true;
 		}
-		if (i > first &&
-		    emit_hunk(fd_a, fd_b, ma->size, &bl, first, i - 1) < 0)
-			goto out;
+		if (i > first) {
+			int r = byte_offsets
+					? emit_hunk_bytes(fd_a, fd_b, ma->size,
+							  &bl, first, i - 1)
+					: emit_hunk(fd_a, fd_b, ma->size, &bl,
+						    first, i - 1);
+
+			if (r < 0)
+				goto out;
+		}
 		first = i;
 	}
 

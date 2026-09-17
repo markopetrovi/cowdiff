@@ -13,7 +13,7 @@
 #include <unistd.h>
 
 static bool opt_brief, opt_stats, opt_force_binary, opt_force_text;
-static bool opt_dump;
+static bool opt_byte_offsets, opt_dump;
 
 static void usage(FILE *f, const char *argv0)
 {
@@ -28,6 +28,9 @@ static void usage(FILE *f, const char *argv0)
 "options:\n"
 "  -q, --brief           report only whether the files differ\n"
 "      --stats           report how many bytes were actually read\n"
+"      --byte-offsets    put byte offsets in hunk headers instead of line\n"
+"                        numbers; skips the scan that line numbers need, at\n"
+"                        the cost of output that patch(1) cannot consume\n"
 "      --force-binary    treat the files as binary\n"
 "      --force-text      treat them as text even if they look binary\n"
 "      --dump-extents    print the extent maps and exit\n"
@@ -128,6 +131,38 @@ static int compare(const char *pa, const char *pb)
 		goto out;
 	}
 
+	if (dl.n == 0) {
+		printf("Files %s and %s are identical\n", pa, pb);
+		rc = 0;
+		goto stats;
+	}
+
+	if (opt_brief) {
+		printf("Files %s and %s differ\n", pa, pb);
+		rc = 1;
+		goto stats;
+	}
+
+	if (opt_force_binary || (!opt_force_text && (is_binary(fd_a) ||
+						     is_binary(fd_b)))) {
+		out = emit_binary_diff(pa, pb, &dl);
+	} else {
+		out = emit_text_diff(pa, pb, fd_a, fd_b, &ma, &mb, &dl,
+				     opt_byte_offsets);
+	}
+	if (out < 0) {
+		fprintf(stderr, "cowdiff: %s\n", strerror(errno));
+		goto out;
+	}
+	rc = out ? 1 : 0;
+
+stats:
+	/*
+	 * After the output, not before: text mode reads more than the
+	 * comparison does, because a hunk header carries line numbers and a
+	 * line number costs a pass over the file.  Reporting first would hide
+	 * exactly the cost worth knowing about.
+	 */
 	if (opt_stats) {
 		unsigned long long total = (unsigned long long)sa.st_size +
 					   (unsigned long long)sb.st_size;
@@ -146,30 +181,6 @@ static int compare(const char *pa, const char *pb)
 			total ? 100.0 * (double)cowdiff_bytes_read / (double)total
 			      : 0.0);
 	}
-
-	if (dl.n == 0) {
-		printf("Files %s and %s are identical\n", pa, pb);
-		rc = 0;
-		goto out;
-	}
-
-	if (opt_brief) {
-		printf("Files %s and %s differ\n", pa, pb);
-		rc = 1;
-		goto out;
-	}
-
-	if (opt_force_binary || (!opt_force_text && (is_binary(fd_a) ||
-						     is_binary(fd_b)))) {
-		out = emit_binary_diff(pa, pb, &dl);
-	} else {
-		out = emit_text_diff(pa, pb, fd_a, fd_b, &ma, &mb, &dl);
-	}
-	if (out < 0) {
-		fprintf(stderr, "cowdiff: %s\n", strerror(errno));
-		goto out;
-	}
-	rc = out ? 1 : 0;
 
 out:
 	anchors_free(&al);
@@ -200,6 +211,8 @@ int main(int argc, char **argv)
 			opt_stats = true;
 		} else if (!strcmp(a, "--force-binary")) {
 			opt_force_binary = true;
+		} else if (!strcmp(a, "--byte-offsets")) {
+			opt_byte_offsets = true;
 		} else if (!strcmp(a, "--force-text")) {
 			opt_force_text = true;
 		} else if (!strcmp(a, "--dump-extents")) {

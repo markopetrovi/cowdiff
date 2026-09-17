@@ -60,6 +60,8 @@ and then re-clone the tail from the original.
 
       -q, --brief          report only whether the files differ
           --stats          report how much was actually read
+          --byte-offsets   put byte offsets in hunk headers instead of line
+                           numbers, which skips the scan line numbers need
           --force-binary   treat the files as binary
           --force-text     treat them as text even if they look binary
           --dump-extents   print the extent maps and exit
@@ -71,12 +73,17 @@ Binary mode is what gets the full benefit — see the caveat below.
 
 ## Limits worth knowing
 
-**Text mode must scan both files.** A unified diff hunk header names line
-numbers, and a line number can only be had by counting the newlines before it.
-So text output reads both files even when every byte is shared; it wins on CPU
-and memory, not on I/O. Binary mode has no such constraint and gets the whole
-win. A `--byte-offsets` mode that puts byte offsets in the hunk headers
-instead is the intended escape hatch.
+**Line numbers cost a pass over both files.** A unified diff hunk header
+names line numbers, and a line number can only be had by counting the newlines
+before it. On a 32 MB reflinked pair with a 23-byte edit, printing that header
+means reading 48% of both files — against 0.45% for `--byte-offsets` and 0.39%
+for binary mode. A factor of 106, spent entirely on the header. So text mode
+in its default form wins on CPU and memory but not on I/O.
+
+`--byte-offsets` keeps the body identical and swaps the header for byte
+offsets, which are already known from the extent map, so it keeps the win.
+The price is output that `patch(1)` cannot consume and a header that a reader
+could mistake for line numbers.
 
 **Without sharing, it is currently slower than `diff`.** When nothing is
 shared the whole file becomes one gap. GNU diff is fast there because it
