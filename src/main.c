@@ -12,6 +12,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <linux/fiemap.h>
+
 static bool opt_brief, opt_stats, opt_force_binary, opt_force_text;
 static bool opt_byte_offsets, opt_dump;
 
@@ -33,7 +35,8 @@ static void usage(FILE *f, const char *argv0)
 "                        the cost of output that patch(1) cannot consume\n"
 "      --force-binary    treat the files as binary\n"
 "      --force-text      treat them as text even if they look binary\n"
-"      --dump-extents    print the extent maps and exit\n"
+"      --dump-extents    print the extent map and exit; with one FILE this\n"
+"                        is that file's map, with two it is both\n"
 "  -h, --help            this message\n"
 "\n"
 "exit status: 0 files are identical, 1 they differ, 2 an error occurred\n",
@@ -49,12 +52,66 @@ static void dump_map(const char *path, const struct extmap *m)
 	for (i = 0; i < m->n; i++) {
 		const struct ext *e = &m->v[i];
 
-		printf("  off=%-12llu len=%-10llu phys=%-14llu %s%s\n",
+		printf("  off=%-12llu len=%-10llu phys=%-14llu %s%s%s%s\n",
 		       (unsigned long long)e->off, (unsigned long long)e->len,
 		       (unsigned long long)e->phys,
 		       e->trusted ? "trusted" : "untrusted",
-		       e->zero ? " zero" : "");
+		       (e->flags & FIEMAP_EXTENT_ENCODED) ? " encoded" : "",
+		       (e->flags & FIEMAP_EXTENT_UNWRITTEN) ? " unwritten" : "",
+		       (e->flags & FIEMAP_EXTENT_SHARED) ? " shared" : "");
 	}
+}
+
+/*
+ * Open a file and read its extent map.  Both the comparison and
+ * --dump-extents need exactly this, so neither owns a copy of it.
+ */
+static int open_map(const char *path, struct extmap *m, int *fd_out,
+		    struct stat *st)
+{
+	int fd;
+
+	extmap_init(m);
+	fd = open(path, O_RDONLY);
+	if (fd < 0) {
+		fprintf(stderr, "cowdiff: %s: %s\n", path, strerror(errno));
+		return -1;
+	}
+	if (fstat(fd, st) < 0) {
+		fprintf(stderr, "cowdiff: %s: %s\n", path, strerror(errno));
+		close(fd);
+		return -1;
+	}
+	if (S_ISDIR(st->st_mode)) {
+		fprintf(stderr, "cowdiff: %s: is a directory\n", path);
+		close(fd);
+		return -1;
+	}
+	if (extmap_load(m, fd, (uint64_t)st->st_size) < 0) {
+		fprintf(stderr, "cowdiff: %s: cannot read extent map: %s\n",
+			path, strerror(errno));
+		close(fd);
+		return -1;
+	}
+
+	*fd_out = fd;
+	return 0;
+}
+
+/* --dump-extents on a single file: no comparison, just the map. */
+static int dump_one(const char *path)
+{
+	struct extmap m;
+	struct stat st;
+	int fd;
+
+	if (open_map(path, &m, &fd, &st) < 0)
+		return 2;
+
+	dump_map(path, &m);
+	close(fd);
+	extmap_free(&m);
+	return 0;
 }
 
 static int compare(const char *pa, const char *pb)
@@ -72,38 +129,14 @@ static int compare(const char *pa, const char *pb)
 	memset(&al, 0, sizeof al);
 	memset(&dl, 0, sizeof dl);
 
-	fd_a = open(pa, O_RDONLY);
-	if (fd_a < 0) {
-		fprintf(stderr, "cowdiff: %s: %s\n", pa, strerror(errno));
+	if (open_map(pa, &ma, &fd_a, &sa) < 0 ||
+	    open_map(pb, &mb, &fd_b, &sb) < 0)
 		goto out;
-	}
-	fd_b = open(pb, O_RDONLY);
-	if (fd_b < 0) {
-		fprintf(stderr, "cowdiff: %s: %s\n", pb, strerror(errno));
-		goto out;
-	}
-
-	if (fstat(fd_a, &sa) < 0 || fstat(fd_b, &sb) < 0) {
-		fprintf(stderr, "cowdiff: %s\n", strerror(errno));
-		goto out;
-	}
-	if (S_ISDIR(sa.st_mode) || S_ISDIR(sb.st_mode)) {
-		fprintf(stderr, "cowdiff: %s: is a directory\n",
-			S_ISDIR(sa.st_mode) ? pa : pb);
-		goto out;
-	}
 
 	/* The same inode twice needs no work and no reads. */
 	if (sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino) {
 		printf("Files %s and %s are identical\n", pa, pb);
 		rc = 0;
-		goto out;
-	}
-
-	if (extmap_load(&ma, fd_a, (uint64_t)sa.st_size) < 0 ||
-	    extmap_load(&mb, fd_b, (uint64_t)sb.st_size) < 0) {
-		fprintf(stderr, "cowdiff: cannot read extent map: %s\n",
-			strerror(errno));
 		goto out;
 	}
 
@@ -232,10 +265,14 @@ int main(int argc, char **argv)
 		}
 	}
 
-	if (!pa || !pb) {
+	/* Dumping a map needs one file; comparing needs two. */
+	if (!pa || (!pb && !opt_dump)) {
 		usage(stderr, argv[0]);
 		return 2;
 	}
+
+	if (opt_dump && !pb)
+		return dump_one(pa);
 
 	return compare(pa, pb);
 }
