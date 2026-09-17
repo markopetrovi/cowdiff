@@ -16,7 +16,13 @@
 #include <string.h>
 #include <unistd.h>
 
-#define CONTEXT 3
+/* Lines of context around each hunk, as in diff -U. */
+static unsigned int context_lines = 3;
+
+void text_diff_set_context(int n)
+{
+	context_lines = n < 0 ? 0u : (unsigned int)n;
+}
 
 bool is_binary(int fd)
 {
@@ -297,9 +303,9 @@ static int emit_hunk(int fd_a, int fd_b, uint64_t size_a,
 	uint64_t old_start, old_count, new_start, new_count;
 	unsigned int back = 0, fwd = 0;
 
-	if (rewind_lines(fd_a, e0->a_off, CONTEXT, &a_lo, &back) < 0)
+	if (rewind_lines(fd_a, e0->a_off, context_lines, &a_lo, &back) < 0)
 		return -1;
-	if (forward_lines(fd_a, e1->a_end, size_a, CONTEXT, &a_hi, &fwd) < 0)
+	if (forward_lines(fd_a, e1->a_end, size_a, context_lines, &a_hi, &fwd) < 0)
 		return -1;
 
 	/*
@@ -360,9 +366,9 @@ static int emit_hunk_bytes(int fd_a, int fd_b, uint64_t size_a,
 	uint64_t a_lo, a_hi, b_lo, b_hi;
 	unsigned int back = 0, fwd = 0;
 
-	if (rewind_lines(fd_a, e0->a_off, CONTEXT, &a_lo, &back) < 0)
+	if (rewind_lines(fd_a, e0->a_off, context_lines, &a_lo, &back) < 0)
 		return -1;
-	if (forward_lines(fd_a, e1->a_end, size_a, CONTEXT, &a_hi, &fwd) < 0)
+	if (forward_lines(fd_a, e1->a_end, size_a, context_lines, &a_hi, &fwd) < 0)
 		return -1;
 
 	b_lo = e0->b_off - (e0->a_off - a_lo);
@@ -402,7 +408,7 @@ static bool gap_is_close(int fd, uint64_t from, uint64_t to)
 		if (pread_full(fd, buf, want, p) < 0)
 			return false;
 		for (i = 0; i < want; i++)
-			if (buf[i] == '\n' && ++nl > 2 * CONTEXT)
+			if (buf[i] == '\n' && ++nl > 2 * context_lines)
 				return false;
 		p += want;
 		spent += want;
@@ -520,7 +526,7 @@ int emit_text_diff(const char *path_a, const char *path_b, int fd_a, int fd_b,
 						  bl.v[i].a_off))
 					flush = true;
 			} else if (bl.v[i].a_line - bl.v[i - 1].a_end_line >
-				   2 * CONTEXT) {
+				   2 * context_lines) {
 				flush = true;
 			}
 		}

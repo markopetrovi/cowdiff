@@ -33,8 +33,10 @@ static void usage(FILE *f, const char *argv0)
 "      --byte-offsets    put byte offsets in hunk headers instead of line\n"
 "                        numbers; skips the scan that line numbers need, at\n"
 "                        the cost of output that patch(1) cannot consume\n"
-"      --force-binary    treat the files as binary\n"
-"      --force-text      treat them as text even if they look binary\n"
+"  -a, --text            treat the files as text even if they look binary\n"
+"      --force-binary    report byte ranges even if they look like text\n"
+"  -U NUM                lines of context around each change (default 3)\n"
+"  -u, --unified         accepted and ignored; unified is the only format\n"
 "      --dump-extents    print the extent map and exit; with one FILE this\n"
 "                        is that file's map, with two it is both\n"
 "  -h, --help            this message\n"
@@ -246,10 +248,35 @@ int main(int argc, char **argv)
 			opt_force_binary = true;
 		} else if (!strcmp(a, "--byte-offsets")) {
 			opt_byte_offsets = true;
-		} else if (!strcmp(a, "--force-text")) {
+		} else if (!strcmp(a, "-a") || !strcmp(a, "--text")) {
 			opt_force_text = true;
 		} else if (!strcmp(a, "--dump-extents")) {
 			opt_dump = true;
+		} else if (!strcmp(a, "-u") || !strcmp(a, "--unified")) {
+			/*
+			 * Unified is the only format there is, so this asks for
+			 * what already happens.  Accepted rather than refused:
+			 * it is the flag most often passed to diff out of habit,
+			 * and failing on it would be a poor way to be a drop-in.
+			 */
+		} else if (!strncmp(a, "-U", 2) || !strncmp(a, "--unified=", 10)) {
+			const char *v = a[1] == 'U' ? a + 2 : a + 10;
+			long n;
+
+			if (*v == '\0') {
+				if (++i >= argc) {
+					fprintf(stderr,
+						"cowdiff: -U needs a number\n");
+					return 2;
+				}
+				v = argv[i];
+			}
+			n = strtol(v, NULL, 10);
+			if (n < 0 || n > 1000000) {
+				fprintf(stderr, "cowdiff: bad context %s\n", v);
+				return 2;
+			}
+			text_diff_set_context((int)n);
 		} else if (a[0] == '-' && a[1] != '\0') {
 			fprintf(stderr, "cowdiff: unknown option %s\n", a);
 			usage(stderr, argv[0]);

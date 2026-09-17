@@ -117,6 +117,33 @@ chk "identical reflink" A.txt A2.txt
 mk B.txt; sed -i '1500i\inserted A\ninserted B\ninserted C' B.txt
 chk "three lines inserted" A.txt B.txt
 
+# --- context lines, matching diff -U ----------------------------------------
+for n in 0 1 2 3 7; do
+	LC_ALL=C diff -U"$n" A.txt B.txt |
+		sed -e 's/^\(---\|+++\) \([^\t]*\)\t.*/\1 \2/' > "$WORK/.expected"
+	"$COW" -U"$n" A.txt B.txt > "$WORK/.actual"
+	if cmp -s "$WORK/.expected" "$WORK/.actual"; then
+		pass=$((pass + 1))
+	else
+		fail=$((fail + 1))
+		echo "FAIL: -U$n context"
+		diff -u "$WORK/.expected" "$WORK/.actual" | head -20
+	fi
+done
+
+# -u asks for the format we always emit and -a is diff's flag for forcing
+# text; both must be accepted rather than refused.  These files differ, so
+# acceptance means status 1, and only status 2 counts as a rejection.
+for opt in -u --unified -a --text; do
+	"$COW" "$opt" A.txt B.txt > /dev/null 2>&1
+	rc=$?
+	if [ "$rc" -le 1 ]; then
+		pass=$((pass + 1))
+	else
+		fail=$((fail + 1)); echo "FAIL: $opt rejected (status $rc)"
+	fi
+done
+
 # --- byte-offset mode -------------------------------------------------------
 # The bodies must match the line-number form exactly, and every hunk's offsets
 # must point at the content that hunk shows.

@@ -420,23 +420,3 @@ int line_end(int fd, uint64_t off, uint64_t limit, uint64_t *out)
 	*out = limit;
 	return 0;
 }
-
-int count_lines(int fd, uint64_t off, uint64_t *out)
-{
-	unsigned char buf[64 * 1024];
-	uint64_t n = 0, p = 0;
-
-	while (p < off) {
-		uint64_t want = off - p < sizeof buf ? off - p : sizeof buf;
-		uint64_t i;
-
-		if (pread_full(fd, buf, want, p) < 0)
-			return -1;
-		for (i = 0; i < want; i++)
-			if (buf[i] == '\n')
-				n++;
-		p += want;
-	}
-	*out = n;
-	return 0;
-}

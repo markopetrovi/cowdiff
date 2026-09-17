@@ -47,12 +47,18 @@ On a pair of reflinked 4 MB files with a 4 KB insertion, this reads 4 KB where
     make            # builds ./cowdiff and tests/probe
     make check      # compares text output against GNU diff across 22 cases
 
-`tests/probe` is a fixture helper: `probe dump FILE` prints an extent map, and
-`probe clone SRC DST SRCOFF LEN DSTOFF` performs `FICLONERANGE`. The latter
+`tests/probe` is a fixture helper doing exactly one thing:
+`probe clone SRC DST SRCOFF LEN DSTOFF`, which performs `FICLONERANGE`. It
 exists because btrfs has no `FALLOC_FL_INSERT_RANGE`, so the only way to build
 a *shifted* share — a tail pointing at the original's extents but at file
 offsets differing by the insert size — is to insert the bytes the ordinary way
 and then re-clone the tail from the original.
+
+`tests/extentcheck.py` covers the paths where the extent map rather than the
+byte comparison decides the answer: compressed extents, shifted shares,
+punched holes, zeros against a hole, inline extents, unwritten extents.
+Fixtures that cannot be built on the filesystem in use skip loudly rather than
+passing quietly.
 
 ## Usage
 
@@ -62,9 +68,11 @@ and then re-clone the tail from the original.
           --stats          report how much was actually read
           --byte-offsets   put byte offsets in hunk headers instead of line
                            numbers, which skips the scan line numbers need
-          --force-binary   treat the files as binary
-          --force-text     treat them as text even if they look binary
-          --dump-extents   print the extent maps and exit
+      -a, --text           treat the files as text even if they look binary
+          --force-binary   report byte ranges even if they look like text
+      -U NUM               lines of context around each change (default 3)
+      -u, --unified        accepted and ignored; unified is the only format
+          --dump-extents   print the extent map and exit
 
 Exit status follows `diff`: 0 identical, 1 different, 2 error.
 

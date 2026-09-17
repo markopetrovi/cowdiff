@@ -237,7 +237,7 @@ void edits_free(struct editlist *el);
 int line_end(int fd, uint64_t off, uint64_t limit, uint64_t *out);
 /* Round a byte offset back to the start of its line. */
 int line_start(int fd, uint64_t off, uint64_t *out);
-/* Number of newlines in [0, off); used for hunk headers. */
-int count_lines(int fd, uint64_t off, uint64_t *out);
+/* Lines of context around each hunk, as in diff -U. */
+void text_diff_set_context(int n);
 
 #endif /* COWDIFF_H */
