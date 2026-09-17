@@ -1,0 +1,8 @@
+# build artifacts
+*.o
+/cowdiff
+/tests/probe
+
+# test scratch -- tests/run.sh recreates its own fixtures
+/.testtmp/
+/cotest/
