@@ -456,6 +456,26 @@ int emit_text_diff(const char *path_a, const char *path_b, int fd_a, int fd_b,
 		    line_end(fd_b, d->b_off + d->b_len, mb->size, &e.b_end) < 0)
 			goto out;
 
+		/*
+		 * A delta that came from comparing the same span of both files
+		 * already carries its own alignment: the bytes differ there and
+		 * agree everywhere else, so the changed lines are simply
+		 * whatever those bytes fall on.  Running a line diff would only
+		 * rediscover that -- and on a file with many scattered changes
+		 * the rediscovery is the entire cost, because the search reads
+		 * the whole range at every level of its recursion.
+		 *
+		 * Only a delta of the same length at the same offset can be
+		 * trusted this way.  A pure insertion or deletion, or content
+		 * that moved, is exactly the case where the alignment is *not*
+		 * known and the search is what finds it.
+		 */
+		if (d->a_len == d->b_len && d->a_off == d->b_off) {
+			if (bedit_push(&bl, e) < 0)
+				goto out;
+			continue;
+		}
+
 		if (lineset_build(&la, fd_a, e.a_off, e.a_end - e.a_off) < 0)
 			goto out;
 		if (lineset_build(&lb, fd_b, e.b_off, e.b_end - e.b_off) < 0) {

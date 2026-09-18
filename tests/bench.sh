@@ -50,7 +50,11 @@ uniq_lines > A.txt
 uniq_lines > B_ident.txt
 uniq_lines | sed "${LINES}p" > /dev/null
 uniq_lines | awk -v n="$LINES" 'NR==n{print "CHANGED"} NR!=n' > B_one.txt
-uniq_lines | awk 'NR%1000==0{print "CHANGED"; next} {print}' > B_scatter.txt
+# Replacements must be the same *length* as what they replace.  Writing a
+# shorter word changes the file size, which turns every later offset into a
+# misalignment and collapses the whole thing into one unequal-length gap --
+# no longer a test of scattered changes at all.
+uniq_lines | awk 'NR%1000==0{print "LINE " NR; next} {print}' > B_scatter.txt
 uniq_lines | awk -v at='"$LINES"*0' '1' > /dev/null
 uniq_lines | awk -v at=$((LINES / 10)) 'NR==at{print "INSERTED"} {print}' > B_insert.txt
 seq 1 "$LINES" | sed 's/^/totally different content /' > B_unrelated.txt
@@ -83,6 +87,18 @@ run "diff -u" diff -u A.txt B_scatter.txt
 run "cowdiff -U0" "$COW" -U0 A.txt B_scatter.txt
 run "cowdiff --byte-offsets" "$COW" --byte-offsets A.txt B_scatter.txt
 run "cowdiff --force-binary" "$COW" --force-binary A.txt B_scatter.txt
+echo
+
+# Changes of a different length throughout: every replacement shifts
+# everything after it, so the files end up different sizes and no byte of one
+# lines up with the other.  This is the shape that defeated the positional
+# alignment in the fast path and drops the whole file into the line search.
+uniq_lines | awk 'NR%1000==0{print "CHANGED"; next} {print}' > B_scatlen.txt
+shape "scattered + length change (no offset lines up at all)"
+run "diff -u" diff -u A.txt B_scatlen.txt
+run "cowdiff -U0" "$COW" -U0 A.txt B_scatlen.txt
+run "cowdiff --byte-offsets" "$COW" --byte-offsets A.txt B_scatlen.txt
+run "cowdiff --force-binary" "$COW" --force-binary A.txt B_scatlen.txt
 echo
 
 shape "line inserted near the top (misaligns everything after it)"
