@@ -101,6 +101,66 @@ static bool lline_eq(const struct lineset *a, size_t i,
 	       memcmp(a->buf + x->boff, b->buf + y->boff, x->len) == 0;
 }
 
+/*
+ * Equivalence classes.
+ *
+ * Every distinct line gets a number, and two lines are equal exactly when
+ * their numbers are.  That matters because of what the search does with it:
+ * the prefix and suffix trimming, the small-range table, and the anchor scan
+ * all run over the whole input many times, and comparing class numbers makes
+ * each of those comparisons an integer compare rather than a memcmp call.
+ * Only assigning the classes costs a byte comparison, and that happens once.
+ *
+ * A class number is only ever handed out after the text has been compared,
+ * so unlike a bare hash it cannot make two different lines look equal, and
+ * two lines that collide in the table still get separate classes.
+ */
+struct cent {
+	uint64_t hash;
+	uint32_t idx;		/* a line belonging to this class */
+	uint32_t cls;		/* CLASS_NONE when the slot is empty */
+	bool from_b;		/* which lineset idx indexes */
+};
+
+#define CLASS_NONE ((uint32_t)-1)
+
+struct ctab {
+	struct cent *v;
+	size_t mask;
+};
+
+/*
+ * The classes, and what the search needs to ask about them.
+ *
+ * Built on first need, not up front.  A diff that the common-prefix and
+ * common-suffix trimming resolves never reaches the anchor search at all, and
+ * charging it a pass over the whole file plus a table sized to match would be
+ * a tax on exactly the easy case.
+ */
+struct dstate {
+	const struct lineset *a, *b;
+	struct ctab t;
+	uint32_t *ca;		/* class of each line of A */
+	uint32_t *cb;		/* class of each line of B */
+	uint32_t *count_a;	/* occurrences of each class in A */
+	uint32_t *count_b;
+	uint32_t *first_b;	/* first line of B in each class */
+	bool built;
+	bool failed;
+};
+
+/*
+ * Are these two lines the same?  Class numbers once they exist, bytes before
+ * that -- which is what makes building them lazily worth doing, since the
+ * trimming usually settles the diff before any class is ever needed.
+ */
+static bool lines_equal(const struct dstate *ds, const struct lineset *a,
+			size_t i, const struct lineset *b, size_t j)
+{
+	return ds->built && !ds->failed ? ds->ca[i] == ds->cb[j]
+					: lline_eq(a, i, b, j);
+}
+
 void edits_free(struct editlist *el)
 {
 	free(el->v);
@@ -144,7 +204,7 @@ static int edit_push(struct editlist *el, size_t alo, size_t ahi,
  */
 static int diff_small(const struct lineset *a, size_t alo, size_t ahi,
 		      const struct lineset *b, size_t blo, size_t bhi,
-		      struct editlist *out)
+		      struct editlist *out, const struct dstate *ds)
 {
 	size_t na = ahi - alo, nb = bhi - blo;
 	size_t w = nb + 1;
@@ -160,7 +220,7 @@ static int diff_small(const struct lineset *a, size_t alo, size_t ahi,
 		for (j = nb + 1; j-- > 0;) {
 			if (i == na || j == nb) {
 				dp[i * w + j] = 0;
-			} else if (lline_eq(a, alo + i, b, blo + j)) {
+			} else if (lines_equal(ds, a, alo + i, b, blo + j)) {
 				dp[i * w + j] = 1 + dp[(i + 1) * w + j + 1];
 			} else {
 				unsigned int x = dp[(i + 1) * w + j];
@@ -175,7 +235,8 @@ static int diff_small(const struct lineset *a, size_t alo, size_t ahi,
 	while (i < na || j < nb) {
 		size_t si, sj;
 
-		if (i < na && j < nb && lline_eq(a, alo + i, b, blo + j)) {
+		if (i < na && j < nb &&
+		    lines_equal(ds, a, alo + i, b, blo + j)) {
 			i++;
 			j++;
 			continue;
@@ -185,7 +246,7 @@ static int diff_small(const struct lineset *a, size_t alo, size_t ahi,
 		sj = j;
 		while (i < na || j < nb) {
 			if (i < na && j < nb &&
-			    lline_eq(a, alo + i, b, blo + j))
+			    lines_equal(ds, a, alo + i, b, blo + j))
 				break;
 			if (i < na && j < nb) {
 				if (dp[(i + 1) * w + j] >= dp[i * w + j + 1])
@@ -223,86 +284,152 @@ out:
  * imprecise here -- it would mean skipping both from the diff and quietly
  * dropping a real difference -- so the anchor search verifies every match.
  */
-struct hent {
-	uint64_t hash;
-	uint32_t idx;		/* first (only) index, when count is 1 */
-	uint32_t count;		/* zero means the slot is empty */
-};
-
-struct htab {
-	struct hent *v;
-	size_t mask;
-};
-
-/* The tables, built on first need rather than up front.  A diff that the
- * common-prefix and common-suffix trimming resolves never reaches the anchor
- * search, and making it pay for a pass over the whole file first is a tax on
- * exactly the easy case. */
-struct dstate {
-	struct htab ta, tb;
-	bool built;
-};
-
-static int htab_init(struct htab *t, size_t n)
+static int ctab_init(struct ctab *t, size_t n)
 {
-	size_t cap = 16;
+	size_t cap = 16, i;
 
 	while (cap < n * 2)
 		cap <<= 1;
-	t->v = calloc(cap, sizeof *t->v);
+	t->v = malloc(cap * sizeof *t->v);
 	if (!t->v)
 		return -1;
+	for (i = 0; i < cap; i++)
+		t->v[i].cls = CLASS_NONE;
 	t->mask = cap - 1;
 	return 0;
 }
 
-static struct hent *htab_slot(const struct htab *t, uint64_t hash)
+/*
+ * The slot for a line, keyed by its bytes.  Two lines share a slot only when
+ * they are actually equal: an occupied slot holding a hash collision is
+ * stepped over, not matched, so a collision costs an extra class rather than
+ * a wrong answer.  The caller tells empty from occupied by the class number.
+ */
+static struct cent *ctab_slot(const struct ctab *t, const struct lineset *a,
+			      const struct lineset *b, const struct lineset *ls,
+			      size_t idx)
 {
+	uint64_t hash = ls->v[idx].hash;
 	size_t i = (size_t)hash & t->mask;
 
-	while (t->v[i].count && t->v[i].hash != hash)
+	while (t->v[i].cls != CLASS_NONE) {
+		const struct lineset *rs = t->v[i].from_b ? b : a;
+
+		if (t->v[i].hash == hash && lline_eq(rs, t->v[i].idx, ls, idx))
+			return &t->v[i];
 		i = (i + 1) & t->mask;
-	return (struct hent *)&t->v[i];
+	}
+	return &t->v[i];
 }
 
-static int htab_count(const struct lineset *ls, struct htab *t)
+/*
+ * Number every line of both linesets.  One pass over each, and the only byte
+ * comparisons are the ones confirming that a hash really matched.
+ */
+static int classes_assign(const struct lineset *a, const struct lineset *b,
+			  struct ctab *t, uint32_t **ca_out, uint32_t **cb_out,
+			  uint32_t *ncls)
 {
+	uint32_t *ca, *cb, next = 0;
 	size_t i;
 
-	if (htab_init(t, ls->n) < 0)
+	if (ctab_init(t, a->n + b->n) < 0)
 		return -1;
-	for (i = 0; i < ls->n; i++) {
-		struct hent *e = htab_slot(t, ls->v[i].hash);
 
-		if (!e->count) {
-			e->hash = ls->v[i].hash;
-			e->idx = (uint32_t)i;
-			e->count = 1;
-		} else {
-			e->count++;
-		}
+	ca = malloc((a->n ? a->n : 1) * sizeof *ca);
+	cb = malloc((b->n ? b->n : 1) * sizeof *cb);
+	if (!ca || !cb) {
+		free(ca);
+		free(cb);
+		free(t->v);
+		t->v = NULL;
+		return -1;
 	}
+
+	for (i = 0; i < a->n; i++) {
+		struct cent *e = ctab_slot(t, a, b, a, i);
+
+		if (e->cls == CLASS_NONE) {
+			e->hash = a->v[i].hash;
+			e->idx = (uint32_t)i;
+			e->from_b = false;
+			e->cls = next++;
+		}
+		ca[i] = e->cls;
+	}
+
+	for (i = 0; i < b->n; i++) {
+		struct cent *e = ctab_slot(t, a, b, b, i);
+
+		if (e->cls == CLASS_NONE) {
+			e->hash = b->v[i].hash;
+			e->idx = (uint32_t)i;
+			e->from_b = true;
+			e->cls = next++;
+		}
+		cb[i] = e->cls;
+	}
+
+	*ca_out = ca;
+	*cb_out = cb;
+	*ncls = next;
 	return 0;
 }
 
-static const struct hent *htab_find(const struct htab *t, uint64_t hash)
+/* How often each class occurs on each side, and where B first has it. */
+static int classes_count(const uint32_t *ca, size_t na, const uint32_t *cb,
+			 size_t nb, uint32_t ncls, uint32_t **cnt_a_out,
+			 uint32_t **cnt_b_out, uint32_t **first_b_out)
 {
-	const struct hent *e = htab_slot(t, hash);
+	uint32_t *cnt_a, *cnt_b, *first_b;
+	size_t i;
 
-	return e->count ? e : NULL;
-}
-
-static int dstate_build(struct dstate *ds, const struct lineset *a,
-			const struct lineset *b)
-{
-	if (ds->built)
-		return ds->ta.v && ds->tb.v ? 0 : -1;
-
-	ds->built = true;
-	if (htab_count(a, &ds->ta) < 0)
+	cnt_a = calloc(ncls ? ncls : 1, sizeof *cnt_a);
+	cnt_b = calloc(ncls ? ncls : 1, sizeof *cnt_b);
+	first_b = malloc((ncls ? ncls : 1) * sizeof *first_b);
+	if (!cnt_a || !cnt_b || !first_b) {
+		free(cnt_a);
+		free(cnt_b);
+		free(first_b);
 		return -1;
-	return htab_count(b, &ds->tb);
+	}
+	for (i = 0; i < ncls; i++)
+		first_b[i] = CLASS_NONE;
+
+	for (i = 0; i < na; i++)
+		cnt_a[ca[i]]++;
+	for (i = 0; i < nb; i++) {
+		if (!cnt_b[cb[i]])
+			first_b[cb[i]] = (uint32_t)i;
+		cnt_b[cb[i]]++;
+	}
+
+	*cnt_a_out = cnt_a;
+	*cnt_b_out = cnt_b;
+	*first_b_out = first_b;
+	return 0;
 }
+
+static int dstate_build(struct dstate *ds)
+{
+	uint32_t ncls = 0;
+
+	if (ds->built)
+		return ds->failed ? -1 : 0;
+	ds->built = true;
+
+	if (classes_assign(ds->a, ds->b, &ds->t, &ds->ca, &ds->cb,
+			   &ncls) < 0)
+		goto fail;
+	if (classes_count(ds->ca, ds->a->n, ds->cb, ds->b->n, ncls,
+			  &ds->count_a, &ds->count_b, &ds->first_b) < 0)
+		goto fail;
+	return 0;
+fail:
+	ds->failed = true;
+	return -1;
+}
+
 
 /*
  * Split a large range at a line that is unique on both sides, which is the
@@ -318,11 +445,12 @@ static int diff_rec(const struct lineset *a, size_t alo, size_t ahi,
 {
 	/* Strip the common ends first: it is cheap, and it usually leaves
 	 * very little behind. */
-	while (alo < ahi && blo < bhi && lline_eq(a, alo, b, blo)) {
+	while (alo < ahi && blo < bhi && lines_equal(ds, a, alo, b, blo)) {
 		alo++;
 		blo++;
 	}
-	while (alo < ahi && blo < bhi && lline_eq(a, ahi - 1, b, bhi - 1)) {
+	while (alo < ahi && blo < bhi &&
+	       lines_equal(ds, a, ahi - 1, b, bhi - 1)) {
 		ahi--;
 		bhi--;
 	}
@@ -333,7 +461,7 @@ static int diff_rec(const struct lineset *a, size_t alo, size_t ahi,
 		return edit_push(out, alo, ahi, blo, bhi);
 
 	if (ahi - alo <= SMALL && bhi - blo <= SMALL)
-		return diff_small(a, alo, ahi, b, blo, bhi, out);
+		return diff_small(a, alo, ahi, b, blo, bhi, out, ds);
 
 	if (depth <= 0)
 		return edit_push(out, alo, ahi, blo, bhi);
@@ -351,7 +479,8 @@ static int diff_anchor(const struct lineset *a, size_t alo, size_t ahi,
 	uint64_t mid_a = alo + (ahi - alo) / 2;
 	uint64_t mid_b = blo + (bhi - blo) / 2;
 
-	if (dstate_build(ds, a, b) < 0)
+	/* Reaching here is what makes the classes worth building. */
+	if (dstate_build(ds) < 0)
 		return -1;
 
 	/*
@@ -359,34 +488,28 @@ static int diff_anchor(const struct lineset *a, size_t alo, size_t ahi,
 	 * the line most likely to be a real correspondence rather than a
 	 * coincidence between two common ones -- and take the match nearest
 	 * the middle so the recursion stays balanced.
+	 *
+	 * With classes this is three array lookups per line and no byte
+	 * comparison at all: a class number was only issued once its bytes
+	 * had been compared, so equal numbers are equal lines.
 	 */
 	for (i = alo; i < ahi; i++) {
-		const struct hent *ea = htab_find(&ds->ta, a->v[i].hash);
-		const struct hent *eb;
+		uint32_t c = ds->ca[i];
+		size_t j;
 		uint64_t d;
 
-		if (!ea || ea->count != 1 || ea->idx != i)
+		if (ds->count_a[c] != 1 || ds->count_b[c] != 1)
 			continue;
-		eb = htab_find(&ds->tb, a->v[i].hash);
-		if (!eb || eb->count != 1)
-			continue;
-		if (eb->idx < blo || eb->idx >= bhi)
-			continue;
-		/*
-		 * The tables hold hashes and equal hashes are not equal
-		 * lines.  Splitting on a collision would skip both lines
-		 * from the diff and drop a real difference, so confirm the
-		 * text before relying on it.
-		 */
-		if (!lline_eq(a, i, b, eb->idx))
+		j = ds->first_b[c];
+		if (j < blo || j >= bhi)
 			continue;
 
 		d = (i > mid_a ? i - mid_a : mid_a - i) +
-		    (eb->idx > mid_b ? eb->idx - mid_b : mid_b - eb->idx);
+		    (j > mid_b ? j - mid_b : mid_b - j);
 		if (!found || d < best_dist) {
 			best_dist = d;
 			best_i = i;
-			best_j = eb->idx;
+			best_j = j;
 			found = true;
 		}
 	}
@@ -418,13 +541,19 @@ int linediff(const struct lineset *a, const struct lineset *b,
 	out->cap = 0;
 
 	memset(&ds, 0, sizeof ds);
+	ds.a = a;
+	ds.b = b;
 
 	/* Depth cap keeps the recursion bounded on pathological input; each
 	 * level at least splits the range, so this is generous. */
 	rc = diff_rec(a, 0, a->n, b, 0, b->n, out, 64, &ds);
 
-	free(ds.ta.v);
-	free(ds.tb.v);
+	free(ds.ca);
+	free(ds.cb);
+	free(ds.count_a);
+	free(ds.count_b);
+	free(ds.first_b);
+	free(ds.t.v);
 	return rc;
 }
 
