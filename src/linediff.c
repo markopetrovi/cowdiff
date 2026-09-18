@@ -209,45 +209,99 @@ out:
 	return rc;
 }
 
-struct hidx {
+/*
+ * Which lines occur exactly once in a file.
+ *
+ * The anchor search needs this at every level of its recursion, and the
+ * obvious way to ask -- sort the range and look for runs of one -- costs a
+ * sort per level, which is where nearly all of this tool's time used to go.
+ * Counting hashes once, up front, answers it for every level at once: a line
+ * that occurs once in the whole file occurs once in any part of it.
+ *
+ * A hash is not the line, so a caller that acts on a match still has to
+ * compare the text.  Treating two colliding lines as one is not merely
+ * imprecise here -- it would mean skipping both from the diff and quietly
+ * dropping a real difference -- so the anchor search verifies every match.
+ */
+struct hent {
 	uint64_t hash;
-	size_t idx;
+	uint32_t idx;		/* first (only) index, when count is 1 */
+	uint32_t count;		/* zero means the slot is empty */
 };
 
-static int hidx_cmp(const void *pa, const void *pb)
-{
-	const struct hidx *a = pa, *b = pb;
+struct htab {
+	struct hent *v;
+	size_t mask;
+};
 
-	if (a->hash != b->hash)
-		return a->hash < b->hash ? -1 : 1;
+/* The tables, built on first need rather than up front.  A diff that the
+ * common-prefix and common-suffix trimming resolves never reaches the anchor
+ * search, and making it pay for a pass over the whole file first is a tax on
+ * exactly the easy case. */
+struct dstate {
+	struct htab ta, tb;
+	bool built;
+};
+
+static int htab_init(struct htab *t, size_t n)
+{
+	size_t cap = 16;
+
+	while (cap < n * 2)
+		cap <<= 1;
+	t->v = calloc(cap, sizeof *t->v);
+	if (!t->v)
+		return -1;
+	t->mask = cap - 1;
 	return 0;
 }
 
-/*
- * Fill `v` with the indices of lines that occur exactly once in the range,
- * sorted by hash so the two sides can be intersected.
- */
-static size_t unique_lines(const struct lineset *ls, size_t lo, size_t hi,
-			   struct hidx *v)
+static struct hent *htab_slot(const struct htab *t, uint64_t hash)
 {
-	size_t n = 0, i = lo;
+	size_t i = (size_t)hash & t->mask;
 
-	while (i < hi) {
-		size_t j = i;
+	while (t->v[i].count && t->v[i].hash != hash)
+		i = (i + 1) & t->mask;
+	return (struct hent *)&t->v[i];
+}
 
-		while (j < hi && ls->v[j].hash == ls->v[i].hash)
-			j++;
-		/* Equal hashes need not mean equal lines, but for choosing an
-		 * anchor that is harmless: a wrong choice only costs an
-		 * opportunity, and the bytes are compared either way. */
-		if (j - i == 1) {
-			v[n].hash = ls->v[i].hash;
-			v[n].idx = i;
-			n++;
+static int htab_count(const struct lineset *ls, struct htab *t)
+{
+	size_t i;
+
+	if (htab_init(t, ls->n) < 0)
+		return -1;
+	for (i = 0; i < ls->n; i++) {
+		struct hent *e = htab_slot(t, ls->v[i].hash);
+
+		if (!e->count) {
+			e->hash = ls->v[i].hash;
+			e->idx = (uint32_t)i;
+			e->count = 1;
+		} else {
+			e->count++;
 		}
-		i = j;
 	}
-	return n;
+	return 0;
+}
+
+static const struct hent *htab_find(const struct htab *t, uint64_t hash)
+{
+	const struct hent *e = htab_slot(t, hash);
+
+	return e->count ? e : NULL;
+}
+
+static int dstate_build(struct dstate *ds, const struct lineset *a,
+			const struct lineset *b)
+{
+	if (ds->built)
+		return ds->ta.v && ds->tb.v ? 0 : -1;
+
+	ds->built = true;
+	if (htab_count(a, &ds->ta) < 0)
+		return -1;
+	return htab_count(b, &ds->tb);
 }
 
 /*
@@ -256,11 +310,11 @@ static size_t unique_lines(const struct lineset *ls, size_t lo, size_t hi,
  */
 static int diff_anchor(const struct lineset *a, size_t alo, size_t ahi,
 		       const struct lineset *b, size_t blo, size_t bhi,
-		       struct editlist *out, int depth);
+		       struct editlist *out, int depth, struct dstate *ds);
 
 static int diff_rec(const struct lineset *a, size_t alo, size_t ahi,
 		    const struct lineset *b, size_t blo, size_t bhi,
-		    struct editlist *out, int depth)
+		    struct editlist *out, int depth, struct dstate *ds)
 {
 	/* Strip the common ends first: it is cheap, and it usually leaves
 	 * very little behind. */
@@ -284,60 +338,56 @@ static int diff_rec(const struct lineset *a, size_t alo, size_t ahi,
 	if (depth <= 0)
 		return edit_push(out, alo, ahi, blo, bhi);
 
-	return diff_anchor(a, alo, ahi, b, blo, bhi, out, depth);
+	return diff_anchor(a, alo, ahi, b, blo, bhi, out, depth, ds);
 }
 
 static int diff_anchor(const struct lineset *a, size_t alo, size_t ahi,
 		       const struct lineset *b, size_t blo, size_t bhi,
-		       struct editlist *out, int depth)
+		       struct editlist *out, int depth, struct dstate *ds)
 {
-	struct hidx *ua, *ub;
-	size_t na = 0, nb = 0;
-	size_t ia, ib;
-	size_t best_i = 0, best_j = 0;
+	size_t i, best_i = 0, best_j = 0;
 	bool found = false;
 	uint64_t best_dist = UINT64_MAX;
 	uint64_t mid_a = alo + (ahi - alo) / 2;
 	uint64_t mid_b = blo + (bhi - blo) / 2;
-	int rc = -1;
 
-	ua = malloc((ahi - alo) * sizeof *ua);
-	ub = malloc((bhi - blo) * sizeof *ub);
-	if (!ua || !ub)
-		goto out;
+	if (dstate_build(ds, a, b) < 0)
+		return -1;
 
-	for (ia = alo; ia < ahi; ia++)
-		ua[na++] = (struct hidx){a->v[ia].hash, ia};
-	for (ib = blo; ib < bhi; ib++)
-		ub[nb++] = (struct hidx){b->v[ib].hash, ib};
-	qsort(ua, na, sizeof *ua, hidx_cmp);
-	qsort(ub, nb, sizeof *ub, hidx_cmp);
+	/*
+	 * Walk this side for a line that occurs exactly once in each file --
+	 * the line most likely to be a real correspondence rather than a
+	 * coincidence between two common ones -- and take the match nearest
+	 * the middle so the recursion stays balanced.
+	 */
+	for (i = alo; i < ahi; i++) {
+		const struct hent *ea = htab_find(&ds->ta, a->v[i].hash);
+		const struct hent *eb;
+		uint64_t d;
 
-	na = unique_lines(a, alo, ahi, ua);
-	nb = unique_lines(b, blo, bhi, ub);
+		if (!ea || ea->count != 1 || ea->idx != i)
+			continue;
+		eb = htab_find(&ds->tb, a->v[i].hash);
+		if (!eb || eb->count != 1)
+			continue;
+		if (eb->idx < blo || eb->idx >= bhi)
+			continue;
+		/*
+		 * The tables hold hashes and equal hashes are not equal
+		 * lines.  Splitting on a collision would skip both lines
+		 * from the diff and drop a real difference, so confirm the
+		 * text before relying on it.
+		 */
+		if (!lline_eq(a, i, b, eb->idx))
+			continue;
 
-	/* Intersect the two unique sets, keeping the match nearest the
-	 * middle so the recursion stays balanced. */
-	ia = ib = 0;
-	while (ia < na && ib < nb) {
-		if (ua[ia].hash < ub[ib].hash) {
-			ia++;
-		} else if (ua[ia].hash > ub[ib].hash) {
-			ib++;
-		} else {
-			uint64_t d = (ua[ia].idx > mid_a ? ua[ia].idx - mid_a
-							 : mid_a - ua[ia].idx) +
-				     (ub[ib].idx > mid_b ? ub[ib].idx - mid_b
-							 : mid_b - ub[ib].idx);
-
-			if (!found || d < best_dist) {
-				best_dist = d;
-				best_i = ua[ia].idx;
-				best_j = ub[ib].idx;
-				found = true;
-			}
-			ia++;
-			ib++;
+		d = (i > mid_a ? i - mid_a : mid_a - i) +
+		    (eb->idx > mid_b ? eb->idx - mid_b : mid_b - eb->idx);
+		if (!found || d < best_dist) {
+			best_dist = d;
+			best_i = i;
+			best_j = eb->idx;
+			found = true;
 		}
 	}
 
@@ -346,32 +396,36 @@ static int diff_anchor(const struct lineset *a, size_t alo, size_t ahi,
 		 * replaced is coarse but honest; a finer answer would need a
 		 * full search, which is exactly what this tool exists to
 		 * avoid. */
-		rc = edit_push(out, alo, ahi, blo, bhi);
-		goto out;
+		return edit_push(out, alo, ahi, blo, bhi);
 	}
 
-	if (diff_rec(a, alo, best_i, b, blo, best_j, out, depth - 1) < 0)
-		goto out;
-	if (diff_rec(a, best_i + 1, ahi, b, best_j + 1, bhi, out, depth - 1) < 0)
-		goto out;
-
-	rc = 0;
-out:
-	free(ua);
-	free(ub);
-	return rc;
+	if (diff_rec(a, alo, best_i, b, blo, best_j, out, depth - 1, ds) < 0)
+		return -1;
+	if (diff_rec(a, best_i + 1, ahi, b, best_j + 1, bhi, out, depth - 1,
+		     ds) < 0)
+		return -1;
+	return 0;
 }
 
 int linediff(const struct lineset *a, const struct lineset *b,
 	     struct editlist *out)
 {
+	struct dstate ds;
+	int rc;
+
 	out->v = NULL;
 	out->n = 0;
 	out->cap = 0;
 
+	memset(&ds, 0, sizeof ds);
+
 	/* Depth cap keeps the recursion bounded on pathological input; each
 	 * level at least splits the range, so this is generous. */
-	return diff_rec(a, 0, a->n, b, 0, b->n, out, 64);
+	rc = diff_rec(a, 0, a->n, b, 0, b->n, out, 64, &ds);
+
+	free(ds.ta.v);
+	free(ds.tb.v);
+	return rc;
 }
 
 /* ---- line boundary helpers -------------------------------------------- */
