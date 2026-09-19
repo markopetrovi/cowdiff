@@ -10,11 +10,8 @@
  * written independently -- the range is the whole file, and an exact O(n*m)
  * answer is out of reach.  That falls back to splitting the range at a line
  * that occurs exactly once on each side, which is what makes ordinary text
- * line up.  Failing even that -- a file where every line is the same leaves
- * nothing to split on -- the middle of the range is tried instead, and only
- * if the lines there are not equal is the range reported as wholly replaced.
- * That last is coarse but never wrong; it just used to be reached far more
- * often than it should have been.
+ * line up; failing even that, the range is reported as wholly replaced, which
+ * is coarse but never wrong.
  */
 #include "cowdiff.h"
 
@@ -24,14 +21,38 @@
 /* Ranges up to this many lines on both sides are diffed exactly. */
 #define SMALL 256
 
+/*
+ * A hash of one line, for grouping equal lines together.
+ *
+ * Word at a time, because this runs over every byte of both files and was the
+ * most expensive loop in the tool's slowest shape.  FNV-1a, which this
+ * replaces, multiplies once per byte with the multiply's result feeding the
+ * next byte, so it cannot start the next step until the last one retires;
+ * eight bytes at a time turns that chain into one step per word instead.
+ *
+ * The hash need not be strong.  Two lines are only ever *known* equal after
+ * their bytes have been compared, and an accidental collision costs one of
+ * those comparisons, so what matters is that equal lines hash equally, that
+ * unequal ones usually do not, and that neither takes long to determine.
+ *
+ * The length is mixed in first so that a line and its own prefix do not start
+ * from the same state.
+ */
 static uint64_t hash_line(const unsigned char *p, size_t len)
 {
-	uint64_t h = 1469598103934665603ULL;
+	uint64_t h = 0x9e3779b97f4a7c15ULL ^ (uint64_t)len;
 
-	while (len--) {
-		h ^= *p++;
-		h *= 1099511628211ULL;
+	while (len >= 8) {
+		uint64_t w;
+
+		memcpy(&w, p, 8);
+		h = (h ^ w) * 0xc2b2ae3d27d4eb4fULL;
+		h ^= h >> 29;
+		p += 8;
+		len -= 8;
 	}
+	while (len--)
+		h = (h ^ *p++) * 0x100000001b3ULL;
 	return h;
 }
 
@@ -132,10 +153,11 @@ static bool lline_eq(const struct lineset *a, size_t i,
  * index in the lineset it came from.  Eight bytes, so that a sort of a few
  * million of them is a few tens of megabytes rather than hundreds.
  *
- * The fingerprint is the *high* half of the hash, because that is the half
- * FNV-1a mixes.  Its multiply carries low bits upward, while the lowest bit
- * of the finished value is only the parity of the bytes fed into it -- so the
- * bottom bits of this hash are the ones not to key on.
+ * The fingerprint is the *high* half of the hash.  A multiply carries low
+ * bits upward and never the other way, so in a hash built from multiplies the
+ * bottom bits are the least mixed -- with the byte-at-a-time tail of this one,
+ * the lowest bit of the result is still only the parity of the bytes fed into
+ * it.  The half that everything has been stirred into is the top half.
  *
  * Equal lines always share a fingerprint, so sorting gathers them together;
  * unequal lines may share one by accident, and grouping compares the text, so

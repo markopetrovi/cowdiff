@@ -119,6 +119,51 @@ static int lc_count(struct lcounter *lc, uint64_t off, uint64_t *out)
 	return 0;
 }
 
+/*
+ * Output goes through a buffer of ours rather than straight into stdio.
+ *
+ * A hunk body is one call per line to fputc and one to fwrite, each of which
+ * takes a lock, and on a shape whose answer is a million lines that dominated
+ * the printing.  Assembling the lines here and handing stdio whole kilobytes
+ * is several times quicker, and the lock is not needed at all: nothing else
+ * in this program writes.
+ */
+#define OBUF_SIZE (256 * 1024)
+static unsigned char obuf[OBUF_SIZE];
+static size_t obuf_len;
+
+static void obuf_flush(void)
+{
+	if (obuf_len) {
+		fwrite_unlocked(obuf, 1, obuf_len, stdout);
+		obuf_len = 0;
+	}
+}
+
+static void obuf_put(const void *p, size_t n)
+{
+	const unsigned char *s = p;
+
+	if (n > OBUF_SIZE) {
+		obuf_flush();
+		fwrite_unlocked(s, 1, n, stdout);
+		return;
+	}
+	if (obuf_len + n > OBUF_SIZE)
+		obuf_flush();
+	memcpy(obuf + obuf_len, s, n);
+	obuf_len += n;
+}
+
+static void obuf_putc(char c)
+{
+	if (obuf_len == OBUF_SIZE)
+		obuf_flush();
+	obuf[obuf_len++] = (unsigned char)c;
+}
+
+static const char no_newline[] = "\n\\ No newline at end of file\n";
+
 static int print_lines(int fd, uint64_t off, uint64_t end, char prefix)
 {
 	unsigned char rbuf[64 * 1024];
@@ -129,37 +174,59 @@ static int print_lines(int fd, uint64_t off, uint64_t end, char prefix)
 
 	while (p < end) {
 		uint64_t want = end - p < sizeof rbuf ? end - p : sizeof rbuf;
-		uint64_t i;
+		uint64_t i = 0;
 
 		if (pread_full(fd, rbuf, want, p) < 0)
 			goto out;
-		for (i = 0; i < want; i++) {
-			if (llen == lcap) {
-				size_t ncap = lcap ? lcap * 2 : 256;
-				unsigned char *nl = realloc(line, ncap);
 
-				if (!nl)
-					goto out;
-				line = nl;
-				lcap = ncap;
+		while (i < want) {
+			unsigned char *nl = memchr(rbuf + i, '\n',
+						   (size_t)(want - i));
+			size_t n = nl ? (size_t)(nl - (rbuf + i)) + 1
+				      : (size_t)(want - i);
+
+			if (llen == 0 && nl) {
+				/* Whole lines in this chunk: straight through. */
+				obuf_putc(prefix);
+				obuf_put(rbuf + i, n);
+			} else {
+				/* A line crossing a chunk boundary, or the
+				 * unterminated last one: gather it first. */
+				if (llen + n > lcap) {
+					size_t ncap = lcap ? lcap : 256;
+					unsigned char *nline;
+
+					while (ncap < llen + n)
+						ncap *= 2;
+					nline = realloc(line, ncap);
+					if (!nline)
+						goto out;
+					line = nline;
+					lcap = ncap;
+				}
+				memcpy(line + llen, rbuf + i, n);
+				llen += n;
+				if (nl) {
+					obuf_putc(prefix);
+					obuf_put(line, llen);
+					llen = 0;
+				}
 			}
-			line[llen++] = rbuf[i];
-			if (rbuf[i] == '\n') {
-				fputc(prefix, stdout);
-				fwrite(line, 1, llen, stdout);
-				llen = 0;
-			}
+			i += n;
 		}
 		p += want;
 	}
 
 	/* A range that stops without a newline stopped at end of file. */
 	if (llen > 0) {
-		fputc(prefix, stdout);
-		fwrite(line, 1, llen, stdout);
-		fputs("\n\\ No newline at end of file\n", stdout);
+		obuf_putc(prefix);
+		obuf_put(line, llen);
+		obuf_put(no_newline, sizeof no_newline - 1);
 	}
 
+	/* Everything buffered here has to reach stdout before the caller
+	 * prints the next hunk header through stdio. */
+	obuf_flush();
 	rc = 0;
 out:
 	free(line);
