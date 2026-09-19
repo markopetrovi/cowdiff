@@ -113,21 +113,37 @@ static bool lline_eq(const struct lineset *a, size_t i,
  *
  * A class number is only ever handed out after the text has been compared,
  * so unlike a bare hash it cannot make two different lines look equal, and
- * two lines that collide in the table still get separate classes.
+ * two lines that collide still get separate classes.
+ *
+ * The assignment sorts; it does not hash.  A hash table large enough for the
+ * lines of both files is probed once per line at a random address, and it is
+ * far bigger than any cache: on the shape this code exists for -- two files
+ * with nothing shared, so the whole of each becomes one range -- it is 400 MB
+ * and costs a cache and TLB miss per line.  Sorting the same lines by hash
+ * instead walks memory in order, and the only table left is small enough to
+ * stay in cache.
  */
-struct cent {
-	uint64_t hash;
-	uint32_t idx;		/* a line belonging to this class */
-	uint32_t cls;		/* CLASS_NONE when the slot is empty */
-	bool from_b;		/* which lineset idx indexes */
+
+/*
+ * One line, reduced to something sortable: a fingerprint of its hash and its
+ * index in the lineset it came from.  Eight bytes, so that a sort of a few
+ * million of them is a few tens of megabytes rather than hundreds.
+ *
+ * The fingerprint is the *high* half of the hash, because that is the half
+ * FNV-1a mixes.  Its multiply carries low bits upward, while the lowest bit
+ * of the finished value is only the parity of the bytes fed into it -- so the
+ * bottom bits of this hash are the ones not to key on.
+ *
+ * Equal lines always share a fingerprint, so sorting gathers them together;
+ * unequal lines may share one by accident, and grouping compares the text, so
+ * a shared fingerprint costs a comparison rather than a wrong answer.
+ */
+struct lref {
+	uint32_t fp;
+	uint32_t idx;
 };
 
 #define CLASS_NONE ((uint32_t)-1)
-
-struct ctab {
-	struct cent *v;
-	size_t mask;
-};
 
 /*
  * The classes, and what the search needs to ask about them.
@@ -139,7 +155,6 @@ struct ctab {
  */
 struct dstate {
 	const struct lineset *a, *b;
-	struct ctab t;
 	uint32_t *ca;		/* class of each line of A */
 	uint32_t *cb;		/* class of each line of B */
 	uint32_t *count_a;	/* occurrences of each class in A */
@@ -270,113 +285,235 @@ out:
 	return rc;
 }
 
+/* Fingerprint and index of every line of a lineset. */
+static void refs_fill(struct lref *v, const struct lineset *ls)
+{
+	size_t i;
+
+	for (i = 0; i < ls->n; i++) {
+		v[i].fp = (uint32_t)(ls->v[i].hash >> 32);
+		v[i].idx = (uint32_t)i;
+	}
+}
+
+/*
+ * Sort refs by fingerprint, least significant byte first, four times.
+ *
+ * No comparisons anywhere in it, which is the point.  qsort would call a
+ * comparison function some sixty million times over this much data, and every
+ * call branches on memory that the previous comparison just left where it
+ * was.  A radix pass instead reads forwards and writes forwards -- into 256
+ * places at once, but each of them in order -- and the histogram it needs is
+ * a kilobyte that stays in L1.
+ *
+ * Four passes is even, so the sorted refs land back in `v` and `tmp` is only
+ * ever scratch.  The check at the end is for whoever changes the count.
+ */
+static void refs_sort(struct lref *v, struct lref *tmp, size_t n)
+{
+	struct lref *src = v, *dst = tmp;
+	unsigned int pass;
+
+	if (n < 2)
+		return;
+
+	for (pass = 0; pass < 4; pass++) {
+		unsigned int shift = pass * 8;
+		size_t cnt[256], pos[256], i, sum;
+		struct lref *swap;
+
+		memset(cnt, 0, sizeof cnt);
+		for (i = 0; i < n; i++)
+			cnt[(src[i].fp >> shift) & 0xff]++;
+		sum = 0;
+		for (i = 0; i < 256; i++) {
+			pos[i] = sum;
+			sum += cnt[i];
+		}
+		for (i = 0; i < n; i++) {
+			unsigned int d = (src[i].fp >> shift) & 0xff;
+
+			dst[pos[d]++] = src[i];
+		}
+
+		swap = src;
+		src = dst;
+		dst = swap;
+	}
+
+	if (src != v)
+		memcpy(v, src, n * sizeof *v);
+}
+
+/*
+ * Renumber the classes so that they follow the order the lines appear in,
+ * A's lines first and then B's.
+ *
+ * Merging hands out class numbers in fingerprint order, and that is the wrong
+ * order to read them back in.  The anchor search walks a file line by line
+ * and for each line looks up count_a[c], count_b[c] and first_b[c] -- three
+ * reads indexed by class, over arrays the size of the class count.  Numbering
+ * the classes in file order makes those three reads walk forwards together,
+ * which is what the class-numbered code this replaced did implicitly; leaving
+ * them in fingerprint order makes every one of them a random access, and the
+ * anchor scan got five times slower for it.  The lines are the same either
+ * way; only the numbering moves.
+ */
+static void classes_renumber(uint32_t *ca, size_t na, uint32_t *cb, size_t nb,
+			     uint32_t ncls, uint32_t *map)
+{
+	uint32_t next = 0;
+	size_t i;
+
+	for (i = 0; i < ncls; i++)
+		map[i] = CLASS_NONE;
+	for (i = 0; i < na; i++) {
+		if (map[ca[i]] == CLASS_NONE)
+			map[ca[i]] = next++;
+		ca[i] = map[ca[i]];
+	}
+	for (i = 0; i < nb; i++) {
+		if (map[cb[i]] == CLASS_NONE)
+			map[cb[i]] = next++;
+		cb[i] = map[cb[i]];
+	}
+}
+
+/*
+ * A class opened while merging one run of equal fingerprints.  Only lines in
+ * the same run can be equal to each other, because equal lines hash equally
+ * and so share a fingerprint.
+ */
+struct oclass {
+	uint32_t cls;
+	uint32_t idx;
+	bool from_b;
+};
+
+/*
+ * How many classes one run may open before later lines stop being merged into
+ * it.
+ *
+ * A run normally holds a single distinct line: two lines share a fingerprint
+ * only if their hashes collide in 32 bits.  Reaching this many means an
+ * adversarial file or a shape this tool has never met, and the answer then is
+ * to stop looking rather than compare every line of the run against every
+ * class opened in it.  A line past the cap still gets a class, just one of
+ * its own -- conservative in the only direction that matters: two lines that
+ * are equal but not *known* equal are simply never matched, so the range
+ * around them is reported as wholly replaced.  Coarser, never wrong.
+ */
+#define GROUP_MAX 64
+
+/*
+ * Number every line of both linesets.
+ *
+ * Sort each file's lines by fingerprint, then walk the two sorted runs
+ * together: one fingerprint is one candidate group of equal lines, and inside
+ * it the text decides.  The byte comparisons happen between lines that the
+ * sort just brought together and that the run keeps in cache; everything else
+ * is sequential.
+ */
+static int classes_assign(const struct lineset *a, const struct lineset *b,
+			  uint32_t **ca_out, uint32_t **cb_out, uint32_t *ncls)
+{
+	struct lref *ra, *rb, *tmp;
+	struct oclass open[GROUP_MAX];
+	uint32_t *ca, *cb, *map = NULL, next = 0;
+	size_t i = 0, j = 0, scratch;
+	int rc = -1;
+
+	scratch = a->n > b->n ? a->n : b->n;
+	ra = malloc((a->n ? a->n : 1) * sizeof *ra);
+	rb = malloc((b->n ? b->n : 1) * sizeof *rb);
+	tmp = malloc((scratch ? scratch : 1) * sizeof *tmp);
+	ca = malloc((a->n ? a->n : 1) * sizeof *ca);
+	cb = malloc((b->n ? b->n : 1) * sizeof *cb);
+	if (!ra || !rb || !tmp || !ca || !cb)
+		goto out;
+
+	refs_fill(ra, a);
+	refs_fill(rb, b);
+	refs_sort(ra, tmp, a->n);
+	refs_sort(rb, tmp, b->n);
+
+	while (i < a->n || j < b->n) {
+		uint32_t fp = (i < a->n && (j >= b->n || ra[i].fp <= rb[j].fp))
+				      ? ra[i].fp
+				      : rb[j].fp;
+		size_t nopen = 0;
+		int side;
+
+		/* Everything in either file carrying this fingerprint. */
+		for (side = 0; side < 2; side++) {
+			const struct lineset *ls = side ? b : a;
+			const struct lref *r = side ? rb : ra;
+			uint32_t *cls = side ? cb : ca;
+			size_t *p = side ? &j : &i;
+
+			while (*p < ls->n && r[*p].fp == fp) {
+				uint32_t idx = r[*p].idx, c = CLASS_NONE;
+				size_t k;
+
+				for (k = 0; k < nopen; k++) {
+					const struct lineset *rs =
+						open[k].from_b ? b : a;
+
+					if (lline_eq(rs, open[k].idx, ls,
+						     idx)) {
+						c = open[k].cls;
+						break;
+					}
+				}
+				if (c == CLASS_NONE) {
+					c = next++;
+					if (nopen < GROUP_MAX)
+						open[nopen++] =
+							(struct oclass){c, idx,
+									side != 0};
+				}
+				cls[idx] = c;
+				(*p)++;
+			}
+		}
+	}
+
+	map = malloc((next ? next : 1) * sizeof *map);
+	if (!map)
+		goto out;
+	classes_renumber(ca, a->n, cb, b->n, next, map);
+
+	*ca_out = ca;
+	*cb_out = cb;
+	*ncls = next;
+	ca = NULL;
+	cb = NULL;
+	rc = 0;
+out:
+	free(map);
+	free(ra);
+	free(rb);
+	free(tmp);
+	free(ca);
+	free(cb);
+	return rc;
+}
+
 /*
  * Which lines occur exactly once in a file.
  *
  * The anchor search needs this at every level of its recursion, and the
  * obvious way to ask -- sort the range and look for runs of one -- costs a
  * sort per level, which is where nearly all of this tool's time used to go.
- * Counting hashes once, up front, answers it for every level at once: a line
+ * Counting classes once, up front, answers it for every level at once: a line
  * that occurs once in the whole file occurs once in any part of it.
  *
  * A hash is not the line, so a caller that acts on a match still has to
  * compare the text.  Treating two colliding lines as one is not merely
  * imprecise here -- it would mean skipping both from the diff and quietly
- * dropping a real difference -- so the anchor search verifies every match.
+ * dropping a real difference -- which is why a class is only ever issued
+ * after its bytes have been compared.
  */
-static int ctab_init(struct ctab *t, size_t n)
-{
-	size_t cap = 16, i;
-
-	while (cap < n * 2)
-		cap <<= 1;
-	t->v = malloc(cap * sizeof *t->v);
-	if (!t->v)
-		return -1;
-	for (i = 0; i < cap; i++)
-		t->v[i].cls = CLASS_NONE;
-	t->mask = cap - 1;
-	return 0;
-}
-
-/*
- * The slot for a line, keyed by its bytes.  Two lines share a slot only when
- * they are actually equal: an occupied slot holding a hash collision is
- * stepped over, not matched, so a collision costs an extra class rather than
- * a wrong answer.  The caller tells empty from occupied by the class number.
- */
-static struct cent *ctab_slot(const struct ctab *t, const struct lineset *a,
-			      const struct lineset *b, const struct lineset *ls,
-			      size_t idx)
-{
-	uint64_t hash = ls->v[idx].hash;
-	size_t i = (size_t)hash & t->mask;
-
-	while (t->v[i].cls != CLASS_NONE) {
-		const struct lineset *rs = t->v[i].from_b ? b : a;
-
-		if (t->v[i].hash == hash && lline_eq(rs, t->v[i].idx, ls, idx))
-			return &t->v[i];
-		i = (i + 1) & t->mask;
-	}
-	return &t->v[i];
-}
-
-/*
- * Number every line of both linesets.  One pass over each, and the only byte
- * comparisons are the ones confirming that a hash really matched.
- */
-static int classes_assign(const struct lineset *a, const struct lineset *b,
-			  struct ctab *t, uint32_t **ca_out, uint32_t **cb_out,
-			  uint32_t *ncls)
-{
-	uint32_t *ca, *cb, next = 0;
-	size_t i;
-
-	if (ctab_init(t, a->n + b->n) < 0)
-		return -1;
-
-	ca = malloc((a->n ? a->n : 1) * sizeof *ca);
-	cb = malloc((b->n ? b->n : 1) * sizeof *cb);
-	if (!ca || !cb) {
-		free(ca);
-		free(cb);
-		free(t->v);
-		t->v = NULL;
-		return -1;
-	}
-
-	for (i = 0; i < a->n; i++) {
-		struct cent *e = ctab_slot(t, a, b, a, i);
-
-		if (e->cls == CLASS_NONE) {
-			e->hash = a->v[i].hash;
-			e->idx = (uint32_t)i;
-			e->from_b = false;
-			e->cls = next++;
-		}
-		ca[i] = e->cls;
-	}
-
-	for (i = 0; i < b->n; i++) {
-		struct cent *e = ctab_slot(t, a, b, b, i);
-
-		if (e->cls == CLASS_NONE) {
-			e->hash = b->v[i].hash;
-			e->idx = (uint32_t)i;
-			e->from_b = true;
-			e->cls = next++;
-		}
-		cb[i] = e->cls;
-	}
-
-	*ca_out = ca;
-	*cb_out = cb;
-	*ncls = next;
-	return 0;
-}
-
-/* How often each class occurs on each side, and where B first has it. */
 static int classes_count(const uint32_t *ca, size_t na, const uint32_t *cb,
 			 size_t nb, uint32_t ncls, uint32_t **cnt_a_out,
 			 uint32_t **cnt_b_out, uint32_t **first_b_out)
@@ -418,8 +555,7 @@ static int dstate_build(struct dstate *ds)
 		return ds->failed ? -1 : 0;
 	ds->built = true;
 
-	if (classes_assign(ds->a, ds->b, &ds->t, &ds->ca, &ds->cb,
-			   &ncls) < 0)
+	if (classes_assign(ds->a, ds->b, &ds->ca, &ds->cb, &ncls) < 0)
 		goto fail;
 	if (classes_count(ds->ca, ds->a->n, ds->cb, ds->b->n, ncls,
 			  &ds->count_a, &ds->count_b, &ds->first_b) < 0)
@@ -553,7 +689,6 @@ int linediff(const struct lineset *a, const struct lineset *b,
 	free(ds.count_a);
 	free(ds.count_b);
 	free(ds.first_b);
-	free(ds.t.v);
 	return rc;
 }
 
