@@ -80,9 +80,10 @@ int lineset_build(struct lineset *ls, int fd, uint64_t off, uint64_t len)
 	}
 	ls->buflen = len;
 
+	/* Counted into a local so the loop can become a vector compare; see
+	 * the same loop in lc_count. */
 	for (i = 0; i < len; i++)
-		if (ls->buf[i] == '\n')
-			nlines++;
+		nlines += ls->buf[i] == '\n';
 	/* A trailing fragment with no newline is still a line -- and it is a
 	 * *different* line from the same text with a newline, which is how
 	 * diff reports a missing newline at end of file. */
