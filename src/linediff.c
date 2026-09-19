@@ -10,8 +10,11 @@
  * written independently -- the range is the whole file, and an exact O(n*m)
  * answer is out of reach.  That falls back to splitting the range at a line
  * that occurs exactly once on each side, which is what makes ordinary text
- * line up; failing even that, the range is reported as wholly replaced, which
- * is coarse but never wrong.
+ * line up.  Failing even that -- a file where every line is the same leaves
+ * nothing to split on -- the middle of the range is tried instead, and only
+ * if the lines there are not equal is the range reported as wholly replaced.
+ * That last is coarse but never wrong; it just used to be reached far more
+ * often than it should have been.
  */
 #include "cowdiff.h"
 
@@ -651,11 +654,32 @@ static int diff_anchor(const struct lineset *a, size_t alo, size_t ahi,
 	}
 
 	if (!found) {
-		/* Nothing unique to split on.  Reporting the range as wholly
-		 * replaced is coarse but honest; a finer answer would need a
-		 * full search, which is exactly what this tool exists to
-		 * avoid. */
-		return edit_push(out, alo, ahi, blo, bhi);
+		/*
+		 * Nothing occurs exactly once on both sides.  Fall back to the
+		 * middle of each range, which is a guess that the two files are
+		 * still line-for-line aligned there.
+		 *
+		 * A line that is not unique is still usable as a split *if the
+		 * two are really equal*: a class number was only issued after
+		 * the bytes were compared, so lines_equal is a proof, and a
+		 * proof is all the recursion needs.  What is being guessed is
+		 * only which of several equal lines corresponds to which; a
+		 * wrong guess splits the range in the wrong place, which gives
+		 * a coarser answer, never a false one -- both sides are still
+		 * diffed exactly.
+		 *
+		 * This matters more than it looks.  Two files that differ in
+		 * one line out of a million, where the common-suffix trim was
+		 * stopped by that same line or by a trailing newline, land
+		 * here with nothing unique to hold, and reporting the range as
+		 * wholly replaced says the million lines changed.  True, and
+		 * useless.  Guessing the middle turns that back into the one
+		 * line it always was.
+		 */
+		best_i = alo + (ahi - alo) / 2;
+		best_j = blo + (bhi - blo) / 2;
+		if (!lines_equal(ds, a, best_i, b, best_j))
+			return edit_push(out, alo, ahi, blo, bhi);
 	}
 
 	if (diff_rec(a, alo, best_i, b, blo, best_j, out, depth - 1, ds) < 0)

@@ -96,6 +96,57 @@ chk "no sharing, every line changed" C.txt E.txt
 seq 5000 1 8000 | sed 's/^/line /' > F.txt
 chk "no sharing, unrelated" C.txt F.txt
 
+# --- files with no unique lines ---------------------------------------------
+# Every line here is the same, so nothing occurs exactly once on either side
+# and the anchor search has nothing to hold on to.  A diff of such a file
+# cannot be compared against diff(1) line for line -- more than one form is
+# correct -- so check what any correct diff must do instead: applied to A it
+# must produce B, and it must not answer a one-line edit with the whole file.
+#
+# Both shapes end with a difference, because a range is only handed to the
+# anchor search when its first and last lines differ: that is what the common
+# prefix and suffix trimming leave behind.
+chk_patch() {
+	local name=$1 A=$2 B=$3
+	local out="$WORK/.pdiff" recon="$WORK/.precon"
+	local touched
+
+	"$COW" -U3 "$A" "$B" > "$out" 2>"$WORK/.err"
+	cp "$A" "$recon"
+	if ! patch --silent --force "$recon" < "$out" 2>/dev/null ||
+	   ! cmp -s "$recon" "$B"; then
+		fail=$((fail + 1))
+		echo "FAIL: $name (diff applied to A does not give B)"
+		head -5 "$out"
+		return
+	fi
+	touched=$(tail -n +3 "$out" | grep -c '^[-+]')
+	if [ "$touched" -gt 40 ]; then
+		fail=$((fail + 1))
+		echo "FAIL: $name: $touched changed lines for a two-line edit" \
+		     "in a $(wc -l < "$A")-line file"
+		return
+	fi
+	pass=$((pass + 1))
+}
+
+seq 1 3000 | sed 's/.*/repeated line/' > P1.txt
+sed -e '1500s/.*/changed/' -e '3000s/.*/also changed/' P1.txt > P2.txt
+chk_patch "repetitive, changes at both ends" P1.txt P2.txt
+
+# The shape this was written for: no newline at the end stops the suffix trim
+# on its first comparison, so a single changed line used to leave the whole
+# file inside one range -- and one range with no unique line in it was
+# reported as wholly replaced, several hundred thousand lines of it.
+#
+# awk, not sed, to build P4: sed keeps the missing final newline, awk adds
+# one.  Without that last line differing, the suffix trim has something to
+# hold and the case never arises -- which is how the first version of this
+# test managed not to test anything.
+yes "repeated line" | head -c 20000 > P3.txt
+awk 'NR==700{print "changed"; next} {print}' P3.txt > P4.txt
+chk_patch "repetitive, change and no trailing newline" P3.txt P4.txt
+
 # --- newline at end of file -------------------------------------------------
 printf 'a\nb\nc' > N1.txt; printf 'a\nb\nd' > N2.txt
 chk "no trailing newline, changed" N1.txt N2.txt
