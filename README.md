@@ -88,26 +88,42 @@ Binary mode is what gets the full benefit — see the caveat below.
 
 ## Limits worth knowing
 
-**Line numbers cost a pass over both files.** A unified diff hunk header
-names line numbers, and a line number can only be had by counting the newlines
-before it. On a 32 MB reflinked pair with a 23-byte edit, printing that header
-means reading 48% of both files — against 0.45% for `--byte-offsets` and 0.39%
-for binary mode. A factor of 106, spent entirely on the header. So text mode
-in its default form wins on CPU and memory but not on I/O.
+**Line numbers cost a pass over both files, as far in as the last hunk.**
+A unified diff hunk header names line numbers, and a line number can only be
+had by counting the newlines before it, so producing one means reading the
+file up to that point. On a 35 MB reflinked pair whose edit sits 91% of the
+way in, printing the header reads 95.6% of the bytes — against 0.43% for
+`--byte-offsets` and 0.37% for binary mode. The percentage is roughly how far
+into the file the last change is, and the CPU that goes with it is about 11x
+the whole rest of the run. Text mode in its default form therefore wins on
+memory but not on I/O, and the extra I/O is spent entirely on the header.
 
 `--byte-offsets` keeps the body identical and swaps the header for byte
 offsets, which are already known from the extent map, so it keeps the win.
 The price is output that `patch(1)` cannot consume and a header that a reader
 could mistake for line numbers.
 
-**Without sharing, it is currently slower than `diff`.** When nothing is
-shared the whole file becomes one gap. GNU diff is fast there because it
-compares line hashes rather than bytes, strips common prefix and suffix, runs
-`discard_confusing_lines()` to exclude most of the search space up front, and
-cuts Myers off with a cost threshold rather than always finding a minimal
-diff. This tool memcmps the gap at byte level and *then* builds and sorts
-hashed line arrays for both sides, at every level of the anchor search. That
-needs the same treatment before it is a safe drop-in for unrelated files.
+**Without sharing, it is close to `diff` and sometimes ahead.** Measured at
+equal context against `diff -U0`, on files larger than any cache:
+
+    reflinked, one change        0.33x      identical, unshared    0.28x
+    scattered changes            0.18x      unrelated              0.94x
+    no unique lines              1.34x      scattered + length     1.61x
+
+The two it still loses are the two where the whole file is genuinely one
+delta — every line differs, or nothing occurs once on both sides — so the
+line search has to run over all of it. GNU diff is better there: it compares
+line hashes rather than bytes, runs `discard_confusing_lines()` to exclude
+most of the search space up front, and cuts Myers off with a cost threshold
+rather than always finding a minimal diff. Everything else — the byte-level
+trim of the common prefix and suffix, the sort-based class assignment, the
+anchor search — has been through a profile and a measurement, and the numbers
+above are what came out.
+
+(A note on comparing: `diff -u` and `cowdiff -U0` do not do the same amount
+of work, since one writes three lines of context and the other none. Use the
+same context on both sides, or the comparison flatters whichever writes
+less.)
 
 **Compressed extents are matched by exact identity only.** For a compressed
 extent `fe_physical` is the real address of the compressed data but
