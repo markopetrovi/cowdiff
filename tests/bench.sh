@@ -143,7 +143,7 @@ run "diff" diff X_A.bin X_ident.bin
 run "cowdiff" "$COW" X_A.bin X_ident.bin
 echo
 
-shape "binary, unrelated, same size (diff stops at the first NUL)"
+shape "binary, unrelated, same size (diff stops at the first difference)"
 run "diff" diff X_A.bin X_C.bin
 run "cowdiff" "$COW" X_A.bin X_C.bin
 run "cowdiff -q" "$COW" -q X_A.bin X_C.bin
