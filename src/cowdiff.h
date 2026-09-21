@@ -245,6 +245,10 @@ struct editlist {
 int lineset_build(struct lineset *ls, int fd, uint64_t off, uint64_t len);
 void lineset_free(struct lineset *ls);
 
+/* How many newlines are in this buffer.  Eight bytes at a time; this is the
+ * whole runtime on the shapes where nothing has to be read to compare. */
+uint64_t count_newlines(const unsigned char *p, size_t n);
+
 /*
  * Line diff of two ranges.  Exact while the ranges are small, which is the
  * case that matters -- a gap between anchors is usually a handful of lines --

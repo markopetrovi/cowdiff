@@ -124,13 +124,8 @@ struct lcounter {
 };
 
 /*
- * The count is accumulated in a local and only written back at the end.  Not
- * for style: with the counter reached through `lc` the compiler could not
- * vectorise this loop, and it is the whole cost of the tool's best case --
- * a reflinked pair, where nothing is read to compare and every millisecond
- * goes into counting newlines for hunk headers.  Counting into a local lets
- * the compare-and-add become a vector compare, which is several times
- * faster even though it looks like the same loop.
+ * The counting itself lives in count_newlines, which reads eight bytes per
+ * step; this is only the reading and the running total.
  */
 static int lc_count(struct lcounter *lc, uint64_t off, uint64_t *out)
 {
@@ -140,13 +135,10 @@ static int lc_count(struct lcounter *lc, uint64_t off, uint64_t *out)
 	while (lc->off < off) {
 		uint64_t want = off - lc->off < sizeof buf ? off - lc->off
 							   : sizeof buf;
-		size_t i, n = 0;
 
 		if (pread_full(lc->fd, buf, want, lc->off) < 0)
 			return -1;
-		for (i = 0; i < want; i++)
-			n += buf[i] == '\n';
-		lines += n;
+		lines += count_newlines(buf, want);
 		lc->off += want;
 	}
 	lc->lines = lines;
