@@ -333,6 +333,148 @@ static int bedit_push(struct beditlist *bl, struct bedit e)
 	return 0;
 }
 
+/* ---- trimming a delta down to the part that differs -------------------- */
+
+/*
+ * A delta whose two sides differ in length never had its bytes compared: the
+ * gap resolver reports such a span as replaced without reading it, because
+ * for binary output that is already the honest answer.  For text output the
+ * line diff is then handed both whole files -- on the benchmark's
+ * one-changed-line shape that is 66% of the runtime spent reading and hashing
+ * 70 MB to find a difference in the last line of one of them.
+ *
+ * So compare what the byte level did not: strip the common prefix and suffix
+ * before building the linesets, and let the line diff see only the region
+ * that actually differs.
+ *
+ * The boundaries have to be handled carefully.  Each side has to be cut at
+ * one of its own line boundaries, or the lineset would begin or end inside a
+ * line; and *both* sides have to give up the same number of bytes, or the
+ * lines left outside the two regions would no longer be the same lines and
+ * the diff would report trailing lines as deleted that are not.  The prefix
+ * is safe on both counts because its bytes are equal, so a line boundary in
+ * one file is one in the other; the suffix is cut back to the first whole
+ * line in it for the same reason.
+ */
+#define TRIM_CHUNK (64 * 1024)
+
+/* How many leading bytes of the two spans are equal, or `limit`. */
+static int common_prefix(int fd_a, uint64_t a, int fd_b, uint64_t b,
+			 uint64_t limit, uint64_t *out)
+{
+	unsigned char ba[TRIM_CHUNK], bb[TRIM_CHUNK];
+	uint64_t k = 0;
+
+	while (k < limit) {
+		uint64_t want = limit - k < TRIM_CHUNK ? limit - k : TRIM_CHUNK;
+		uint64_t i;
+
+		if (pread_full(fd_a, ba, want, a + k) < 0 ||
+		    pread_full(fd_b, bb, want, b + k) < 0)
+			return -1;
+		if (memcmp(ba, bb, want) == 0) {
+			k += want;
+			continue;
+		}
+		for (i = 0; i < want; i++) {
+			if (ba[i] != bb[i]) {
+				*out = k + i;
+				return 0;
+			}
+		}
+	}
+	*out = limit;
+	return 0;
+}
+
+/* How many trailing bytes of the two spans are equal, or `limit`. */
+static int common_suffix(int fd_a, uint64_t a_end, int fd_b, uint64_t b_end,
+			 uint64_t limit, uint64_t *out)
+{
+	unsigned char ba[TRIM_CHUNK], bb[TRIM_CHUNK];
+	uint64_t k = 0;
+
+	while (k < limit) {
+		uint64_t want = limit - k < TRIM_CHUNK ? limit - k : TRIM_CHUNK;
+		uint64_t i;
+
+		if (pread_full(fd_a, ba, want, a_end - k - want) < 0 ||
+		    pread_full(fd_b, bb, want, b_end - k - want) < 0)
+			return -1;
+		if (memcmp(ba, bb, want) == 0) {
+			k += want;
+			continue;
+		}
+		for (i = want; i-- > 0;) {
+			if (ba[i] != bb[i]) {
+				*out = k + (want - 1 - i);
+				return 0;
+			}
+		}
+	}
+	*out = limit;
+	return 0;
+}
+
+/* The first line start at or after `off`, or `end` if there is none. */
+static int line_start_from(int fd, uint64_t off, uint64_t end, uint64_t *out)
+{
+	unsigned char buf[16 * 1024];
+	uint64_t p = off;
+
+	while (p < end) {
+		uint64_t want = end - p < sizeof buf ? end - p : sizeof buf;
+		unsigned char *nl;
+
+		if (pread_full(fd, buf, want, p) < 0)
+			return -1;
+		nl = memchr(buf, '\n', want);
+		if (nl) {
+			*out = p + (uint64_t)(nl - buf) + 1;
+			return 0;
+		}
+		p += want;
+	}
+	*out = end;
+	return 0;
+}
+
+/*
+ * Shrink a delta's two line-snapped spans to the part that differs, in place.
+ * Never grows them, and both sides always lose the same number of bytes.
+ */
+static int span_trim(int fd_a, uint64_t *alo, uint64_t *ahi,
+		     int fd_b, uint64_t *blo, uint64_t *bhi)
+{
+	uint64_t alen = *ahi - *alo, blen = *bhi - *blo;
+	uint64_t limit = alen < blen ? alen : blen;
+	uint64_t kp = 0, ks = 0, x;
+
+	if (common_prefix(fd_a, *alo, fd_b, *blo, limit, &kp) < 0)
+		return -1;
+	if (kp) {
+		/* Back to the start of the line the first difference is on. */
+		if (line_start(fd_a, *alo + kp, &x) < 0)
+			return -1;
+		kp = x - *alo;
+	}
+
+	if (common_suffix(fd_a, *ahi, fd_b, *bhi, limit - kp, &ks) < 0)
+		return -1;
+	if (ks) {
+		/* Forward to the first whole line of the common suffix. */
+		if (line_start_from(fd_a, *ahi - ks, *ahi, &x) < 0)
+			return -1;
+		ks = *ahi - x;
+	}
+
+	*alo += kp;
+	*blo += kp;
+	*ahi -= ks;
+	*bhi -= ks;
+	return 0;
+}
+
 /* Map a line index back to a byte offset within a lineset. */
 static uint64_t ls_off(const struct lineset *ls, uint64_t base, size_t i)
 {
@@ -553,6 +695,15 @@ int emit_text_diff(const char *path_a, const char *path_b, int fd_a, int fd_b,
 				goto out;
 			continue;
 		}
+
+		/*
+		 * Everything above the fast path arrives here without its bytes
+		 * having been compared, so work out how much of the two spans
+		 * is actually common before reading them in full.
+		 */
+		if (span_trim(fd_a, &e.a_off, &e.a_end, fd_b, &e.b_off,
+			      &e.b_end) < 0)
+			goto out;
 
 		if (lineset_build(&la, fd_a, e.a_off, e.a_end - e.a_off) < 0)
 			goto out;
