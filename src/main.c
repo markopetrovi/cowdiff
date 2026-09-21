@@ -162,7 +162,7 @@ int compare_files(const char *pa, const char *pb, bool in_recursion)
 		goto out;
 	}
 	if (deltas_find(fd_a, &ma, (uint64_t)sa.st_size, fd_b, &mb,
-			(uint64_t)sb.st_size, &al, &dl) < 0) {
+			(uint64_t)sb.st_size, &al, &dl, opt_brief) < 0) {
 		fprintf(stderr, "cowdiff: %s\n", strerror(errno));
 		goto out;
 	}

@@ -151,10 +151,18 @@ void deltas_free(struct deltalist *dl);
  * Walk the gaps between anchors and resolve each one into deltas, reading
  * only what cannot be proven equal.  `fd_a`/`fd_b` must be open for reading.
  * Returns 0 on success, -1 on error.
+ *
+ * With `stop_at_first` the walk ends at the first difference it proves and
+ * `out` holds only that one, which is enough to answer -q: a difference that
+ * has been compared settles the question, so there is nothing left to earn.
+ * The other verdict is not like that -- "identical" has to cover every byte
+ * that was not proven shared -- so this only ever skips work on the way to
+ * saying the files differ.
  */
 int deltas_find(int fd_a, const struct extmap *a, uint64_t size_a,
 		int fd_b, const struct extmap *b, uint64_t size_b,
-		const struct anchorlist *al, struct deltalist *out);
+		const struct anchorlist *al, struct deltalist *out,
+		bool stop_at_first);
 
 /* ---- io --------------------------------------------------------------- */
 

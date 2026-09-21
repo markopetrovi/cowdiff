@@ -81,10 +81,15 @@ static int deltas_push(struct deltalist *dl, uint64_t a_off, uint64_t a_len,
 /*
  * Read both sides of an equal-length span and record the runs that differ.
  * This is the only place the tool reads two buffers and compares them.
+ *
+ * Returns 0 having walked the span, 1 having stopped because `stop` was set
+ * and a difference had been recorded, or -1 on error.  Stopping is sound
+ * because a difference that has been *compared* proves the files differ,
+ * while the opposite verdict is the one that has to be earned.
  */
 static int compare_range(int fd_a, int fd_b, uint64_t off, uint64_t len,
 			 unsigned char *ba, unsigned char *bb, size_t cap,
-			 struct deltalist *out)
+			 struct deltalist *out, bool stop)
 {
 	uint64_t p = off;
 
@@ -103,8 +108,11 @@ static int compare_range(int fd_a, int fd_b, uint64_t off, uint64_t len,
 			continue;
 		}
 
-		if (deltas_full(out))
-			return deltas_push(out, p, left, p, left);
+		if (deltas_full(out)) {
+			if (deltas_push(out, p, left, p, left) < 0)
+				return -1;
+			return stop ? 1 : 0;
+		}
 
 		i = 0;
 		while (i < n) {
@@ -133,6 +141,8 @@ static int compare_range(int fd_a, int fd_b, uint64_t off, uint64_t len,
 			if (deltas_push(out, p + start, end - start,
 					p + start, end - start) < 0)
 				return -1;
+			if (stop)
+				return 1;
 		}
 
 		p += n;
@@ -148,9 +158,11 @@ static int gap_equal_range(int fd_a, const struct extmap *ma,
 			   int fd_b, const struct extmap *mb,
 			   uint64_t off, uint64_t len,
 			   unsigned char *ba, unsigned char *bb, size_t cap,
-			   struct iobuf *scratch, struct deltalist *out)
+			   struct iobuf *scratch, struct deltalist *out,
+			   bool stop)
 {
 	uint64_t p = off, end_all = off + len;
+	int rc;
 
 	while (p < end_all) {
 		const struct ext *ea = extmap_at(ma, p);
@@ -181,12 +193,17 @@ static int gap_equal_range(int fd_a, const struct extmap *ma,
 
 			if (range_is_zero(fd, m, p, next - p, scratch, &z) < 0)
 				return -1;
-			if (!z && deltas_push(out, p, next - p, p, next - p) < 0)
-				return -1;
+			if (!z) {
+				if (deltas_push(out, p, next - p, p, next - p) < 0)
+					return -1;
+				if (stop)
+					return 1;
+			}
 		} else {
-			if (compare_range(fd_a, fd_b, p, next - p, ba, bb, cap,
-					  out) < 0)
-				return -1;
+			rc = compare_range(fd_a, fd_b, p, next - p, ba, bb, cap,
+					   out, stop);
+			if (rc != 0)
+				return rc;
 		}
 
 		p = next;
@@ -198,7 +215,7 @@ static int resolve_gap(int fd_a, const struct extmap *ma,
 		       int fd_b, const struct extmap *mb,
 		       uint64_t as, uint64_t ae, uint64_t bs, uint64_t be,
 		       unsigned char *ba, unsigned char *bb, size_t cap,
-		       struct iobuf *scratch, struct deltalist *out)
+		       struct iobuf *scratch, struct deltalist *out, bool stop)
 {
 	uint64_t alen = ae - as, blen = be - bs;
 
@@ -206,14 +223,20 @@ static int resolve_gap(int fd_a, const struct extmap *ma,
 		return 0;
 
 	/* One side has nothing here: a pure insertion or deletion. */
-	if (alen == 0)
-		return deltas_push(out, as, 0, bs, blen);
-	if (blen == 0)
-		return deltas_push(out, as, alen, bs, 0);
+	if (alen == 0) {
+		if (deltas_push(out, as, 0, bs, blen) < 0)
+			return -1;
+		return stop ? 1 : 0;
+	}
+	if (blen == 0) {
+		if (deltas_push(out, as, alen, bs, 0) < 0)
+			return -1;
+		return stop ? 1 : 0;
+	}
 
 	if (alen == blen && as == bs)
 		return gap_equal_range(fd_a, ma, fd_b, mb, as, alen, ba, bb, cap,
-				       scratch, out);
+				       scratch, out, stop);
 
 	/*
 	 * Different lengths, or content that sits at different offsets on
@@ -221,12 +244,15 @@ static int resolve_gap(int fd_a, const struct extmap *ma,
 	 * this is what a line diff then refines, and for binary output it is
 	 * already the honest answer.
 	 */
-	return deltas_push(out, as, alen, bs, blen);
+	if (deltas_push(out, as, alen, bs, blen) < 0)
+		return -1;
+	return stop ? 1 : 0;
 }
 
 int deltas_find(int fd_a, const struct extmap *a, uint64_t size_a,
 		int fd_b, const struct extmap *b, uint64_t size_b,
-		const struct anchorlist *al, struct deltalist *out)
+		const struct anchorlist *al, struct deltalist *out,
+		bool stop_at_first)
 {
 	unsigned char *ba = NULL, *bb = NULL;
 	struct iobuf scratch;
@@ -255,10 +281,17 @@ int deltas_find(int fd_a, const struct extmap *a, uint64_t size_a,
 	for (k = 0; k <= al->n; k++) {
 		uint64_t a_end = (k < al->n) ? al->v[k].a_off : size_a;
 		uint64_t b_end = (k < al->n) ? al->v[k].b_off : size_b;
+		int gr;
 
-		if (resolve_gap(fd_a, a, fd_b, b, prev_a, a_end, prev_b, b_end,
-				ba, bb, CHUNK, &scratch, out) < 0)
+		gr = resolve_gap(fd_a, a, fd_b, b, prev_a, a_end, prev_b, b_end,
+				 ba, bb, CHUNK, &scratch, out, stop_at_first);
+		if (gr < 0)
 			goto out;
+		if (gr > 0) {
+			/* One difference is all the caller asked for. */
+			rc = 0;
+			goto out;
+		}
 
 		if (k < al->n) {
 			prev_a = al->v[k].a_off + al->v[k].len;

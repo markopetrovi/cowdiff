@@ -246,6 +246,26 @@ else
 	fail=$((fail + 1))
 fi
 
+# --- -q agrees with diff -q -------------------------------------------------
+# -q stops at the first difference it proves.  That is sound only because
+# "differ" is settled by one difference while "identical" has to cover every
+# byte that was not proven shared -- so the walk may be cut short on the way
+# to one verdict and never on the way to the other.  A wrong verdict here
+# would be silent, which is the failure mode this tool exists to avoid.
+for pair in "A.txt B.txt" "A.txt A2.txt" "C.txt D.txt" "C.txt E.txt" \
+	    "N1.txt N2.txt" "N1.txt N3.txt" "N1b.txt N1c.txt" \
+	    "Z1.txt Z2.txt" "Z1.txt Z3.txt" "P1.txt P2.txt" "P3.txt P4.txt"; do
+	set -- $pair
+	diff -q "$1" "$2" > /dev/null 2>&1; want=$?
+	"$COW" -q "$1" "$2" > /dev/null 2>&1; got=$?
+	if [ "$want" -eq "$got" ]; then
+		pass=$((pass + 1))
+	else
+		fail=$((fail + 1))
+		echo "FAIL: -q on $1 vs $2: diff says $want, cowdiff says $got"
+	fi
+done
+
 rm -f "$WORK"/.expected "$WORK"/.actual "$WORK"/.err
 echo
 echo "passed $pass, failed $fail"
