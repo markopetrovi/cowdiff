@@ -148,6 +148,16 @@ struct deltalist {
 void deltas_free(struct deltalist *dl);
 
 /*
+ * How many bytes at the start (or end) of two byte ranges are equal, capped
+ * at `limit`.  Reads both ranges; used both to narrow a delta before the line
+ * diff sees it and to find what a pair of different-length spans still share.
+ */
+int common_prefix(int fd_a, uint64_t a, int fd_b, uint64_t b, uint64_t limit,
+		  uint64_t *out);
+int common_suffix(int fd_a, uint64_t a_end, int fd_b, uint64_t b_end,
+		  uint64_t limit, uint64_t *out);
+
+/*
  * Walk the gaps between anchors and resolve each one into deltas, reading
  * only what cannot be proven equal.  `fd_a`/`fd_b` must be open for reading.
  * Returns 0 on success, -1 on error.

@@ -31,6 +31,67 @@
  */
 #define DELTA_MAX (1u << 18)
 
+/* Bytes read at a time when looking for the ends two spans share. */
+#define TRIM_CHUNK (64 * 1024)
+
+/* How many leading bytes of the two spans are equal, or `limit`. */
+int common_prefix(int fd_a, uint64_t a, int fd_b, uint64_t b, uint64_t limit,
+		  uint64_t *out)
+{
+	unsigned char ba[TRIM_CHUNK], bb[TRIM_CHUNK];
+	uint64_t k = 0;
+
+	while (k < limit) {
+		uint64_t want = limit - k < TRIM_CHUNK ? limit - k : TRIM_CHUNK;
+		uint64_t i;
+
+		if (pread_full(fd_a, ba, want, a + k) < 0 ||
+		    pread_full(fd_b, bb, want, b + k) < 0)
+			return -1;
+		if (memcmp(ba, bb, want) == 0) {
+			k += want;
+			continue;
+		}
+		for (i = 0; i < want; i++) {
+			if (ba[i] != bb[i]) {
+				*out = k + i;
+				return 0;
+			}
+		}
+	}
+	*out = limit;
+	return 0;
+}
+
+/* How many trailing bytes of the two spans are equal, or `limit`. */
+int common_suffix(int fd_a, uint64_t a_end, int fd_b, uint64_t b_end,
+		  uint64_t limit, uint64_t *out)
+{
+	unsigned char ba[TRIM_CHUNK], bb[TRIM_CHUNK];
+	uint64_t k = 0;
+
+	while (k < limit) {
+		uint64_t want = limit - k < TRIM_CHUNK ? limit - k : TRIM_CHUNK;
+		uint64_t i;
+
+		if (pread_full(fd_a, ba, want, a_end - k - want) < 0 ||
+		    pread_full(fd_b, bb, want, b_end - k - want) < 0)
+			return -1;
+		if (memcmp(ba, bb, want) == 0) {
+			k += want;
+			continue;
+		}
+		for (i = want; i-- > 0;) {
+			if (ba[i] != bb[i]) {
+				*out = k + (want - 1 - i);
+				return 0;
+			}
+		}
+	}
+	*out = limit;
+	return 0;
+}
+
 void deltas_free(struct deltalist *dl)
 {
 	free(dl->v);
@@ -240,10 +301,41 @@ static int resolve_gap(int fd_a, const struct extmap *ma,
 
 	/*
 	 * Different lengths, or content that sits at different offsets on
-	 * the two sides.  Report the whole span as replaced; for text output
-	 * this is what a line diff then refines, and for binary output it is
-	 * already the honest answer.
+	 * the two sides, so the spans cannot be lined up and compared as a
+	 * whole.  What they do share can still be found, though: a file that
+	 * gained or lost bytes in the middle is identical before and after
+	 * them, and those ends need not be reported as replaced.
+	 *
+	 * This matters most for binary output, where there is no line diff
+	 * afterwards to refine anything.  Without it, a six-byte change to a
+	 * 35 MB file is reported as 35 MB of differing region -- true, and
+	 * useless in the same way the text answer in the handoff notes' §9
+	 * was, and for the same reason: a coarse answer is indistinguishable
+	 * from no answer at all.
+	 *
+	 * A caller that only wants to know whether the files differ is given
+	 * the whole span instead.  Finding the common ends costs a read of
+	 * everything up to the first difference, and -q does not need to
+	 * know where the difference is.
 	 */
+	if (!stop) {
+		uint64_t limit = alen < blen ? alen : blen;
+		uint64_t kp = 0, ks = 0;
+
+		if (common_prefix(fd_a, as, fd_b, bs, limit, &kp) < 0)
+			return -1;
+		if (common_suffix(fd_a, ae, fd_b, be, limit - kp, &ks) < 0)
+			return -1;
+		/* Both empty means the spans are the same bytes at different
+		 * offsets, which is not "nothing changed here". */
+		if (alen - kp - ks || blen - kp - ks) {
+			if (deltas_push(out, as + kp, alen - kp - ks,
+					bs + kp, blen - kp - ks) < 0)
+				return -1;
+			return 0;
+		}
+	}
+
 	if (deltas_push(out, as, alen, bs, blen) < 0)
 		return -1;
 	return stop ? 1 : 0;

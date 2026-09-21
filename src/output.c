@@ -372,66 +372,6 @@ static int bedit_push(struct beditlist *bl, struct bedit e)
  * one file is one in the other; the suffix is cut back to the first whole
  * line in it for the same reason.
  */
-#define TRIM_CHUNK (64 * 1024)
-
-/* How many leading bytes of the two spans are equal, or `limit`. */
-static int common_prefix(int fd_a, uint64_t a, int fd_b, uint64_t b,
-			 uint64_t limit, uint64_t *out)
-{
-	unsigned char ba[TRIM_CHUNK], bb[TRIM_CHUNK];
-	uint64_t k = 0;
-
-	while (k < limit) {
-		uint64_t want = limit - k < TRIM_CHUNK ? limit - k : TRIM_CHUNK;
-		uint64_t i;
-
-		if (pread_full(fd_a, ba, want, a + k) < 0 ||
-		    pread_full(fd_b, bb, want, b + k) < 0)
-			return -1;
-		if (memcmp(ba, bb, want) == 0) {
-			k += want;
-			continue;
-		}
-		for (i = 0; i < want; i++) {
-			if (ba[i] != bb[i]) {
-				*out = k + i;
-				return 0;
-			}
-		}
-	}
-	*out = limit;
-	return 0;
-}
-
-/* How many trailing bytes of the two spans are equal, or `limit`. */
-static int common_suffix(int fd_a, uint64_t a_end, int fd_b, uint64_t b_end,
-			 uint64_t limit, uint64_t *out)
-{
-	unsigned char ba[TRIM_CHUNK], bb[TRIM_CHUNK];
-	uint64_t k = 0;
-
-	while (k < limit) {
-		uint64_t want = limit - k < TRIM_CHUNK ? limit - k : TRIM_CHUNK;
-		uint64_t i;
-
-		if (pread_full(fd_a, ba, want, a_end - k - want) < 0 ||
-		    pread_full(fd_b, bb, want, b_end - k - want) < 0)
-			return -1;
-		if (memcmp(ba, bb, want) == 0) {
-			k += want;
-			continue;
-		}
-		for (i = want; i-- > 0;) {
-			if (ba[i] != bb[i]) {
-				*out = k + (want - 1 - i);
-				return 0;
-			}
-		}
-	}
-	*out = limit;
-	return 0;
-}
-
 /* The first line start at or after `off`, or `end` if there is none. */
 static int line_start_from(int fd, uint64_t off, uint64_t end, uint64_t *out)
 {
