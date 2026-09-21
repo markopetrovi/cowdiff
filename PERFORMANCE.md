@@ -129,6 +129,12 @@ identical files cost the same as they always did, and twice as fast as
 
 Already done, newest first:
 
+    3d2de4c  Update the limits section for where the tool now stands
+    4754824  Count newlines eight bytes at a time
+    7e186aa  Benchmark the binary and -q paths
+    e10f74f  Write the file's timestamp in the ---/+++ header, as diff does
+    29a926b  Note the -q shortcut in the handoff notes
+    0d4e5c9  Let -q stop at the first difference it proves
     0685481  Trim a delta to the part that differs before diffing it
     e11d53a  Add a benchmark harness that can see a few percent
     cb309b5  Let the newline counts vectorise
@@ -358,23 +364,24 @@ has ever been pushed; this is a local repository only.
 
 ## 13. Not done
 
-- On the reflinked shape the newline count is still 94% of the runtime,
-  though of a much smaller number (0.034s): roughly 32 MB of `pread` to reach
-  a hunk near the end of the file. The vectorised count should manage that in
-  a few ms, so something else in that path is worth a look (§8).
-- The `GROUP_MAX` cap in `classes_assign` has never run. Reaching it needs 64
-  distinct lines sharing one 32-bit fingerprint, which is not reachable by
-  accident and would take a crafted file.
-- There is no randomized testing. The 36 checks in `tests/run.sh` are
+- There is no randomized testing. The 47 checks in `tests/run.sh` are
   hand-built shapes, and §9's bug — the worst one found so far — lived in a
   fallback path that no hand-built shape exercised. A differential fuzz
   against GNU diff, using "applying the output to A rebuilds B" as the
   oracle rather than a byte-for-byte match, is the obvious next thing to
   build.
+- The `GROUP_MAX` cap in `classes_assign` has never run. Reaching it needs 64
+  distinct lines sharing one 32-bit fingerprint, which is not reachable by
+  accident and would take a crafted file.
 - Files with more than 2^31 lines would truncate a line index; `struct lref`
   and `struct cent` before it both store it in 32 bits.
-- The `---`/`+++` header has no timestamp, where `diff(1)` writes the file's
-  mtime after a tab. `tests/run.sh` strips it before comparing. Nobody has
-  established whether that was a decision or an omission; `patch(1)` ignores
-  it either way, and the output being reproducible run to run is a side
-  effect that a test suite likes.
+- On the reflinked shape the newline count is the runtime (0.019s of it),
+  at about 1.8x what `wc -l` spends on the same job and the same bytes. The
+  loop is now eight bytes at a time (§4, 4754824); what is left is the read
+  underneath it, which 64 KB chunks against `wc`'s larger ones may not be
+  describing well. A 1 MB buffer was tried and measured at 1.6%, so the
+  difference is somewhere else — worth a `perf` run rather than a guess.
+- The two shapes in §4 that this tool still loses are the ones where the
+  whole file is one delta. Beating `diff` there means a bounded Myers-style
+  search, or `discard_confusing_lines()`-style filtering, and neither is a
+  small change.
