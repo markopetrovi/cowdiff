@@ -117,7 +117,15 @@ Ahead of GNU diff on six of the eight, including the two that were more than
 4× behind before §10. The two it still loses are the two where the whole file
 is genuinely one delta — every line of "scattered + length change" differs,
 and "no unique lines" has nothing to anchor on — so the line search really
-does have to run over all of it.
+does have to run over all of it.  Compare at equal context: those rows are
+`cowdiff -U0` against `diff -u`, and `diff -U0` is the fair partner.
+
+`-q` stops at the first difference it proves (0d4e5c9), which is the one
+place the walk may be cut short: on 64 MB of unrelated equal-sized files,
+0.060s → 0.0020s.  What it must never do is stop on the way to saying
+"identical" — that verdict has to cover every byte not proven shared, so
+identical files cost the same as they always did, and twice as fast as
+`diff -q` because `diff -q` reads them too.
 
 Already done, newest first:
 
