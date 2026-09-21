@@ -129,6 +129,7 @@ identical files cost the same as they always did, and twice as fast as
 
 Already done, newest first:
 
+    f8e232a  Report what a shifted span shares, not the whole span
     3d2de4c  Update the limits section for where the tool now stands
     4754824  Count newlines eight bytes at a time
     7e186aa  Benchmark the binary and -q paths
@@ -304,6 +305,22 @@ not the same as "good enough to ship". The invariant in §2 is about the
 direction of error, but an answer that is technically true and practically
 useless is its own kind of failure, and this one was in the fallback path
 where nobody was looking.
+
+**The same defect was in the binary path, and stayed there for longer**
+(f8e232a).  `resolve_gap()` treats a gap whose two spans differ in length, or
+hold the same content at different offsets, as uncomparable — which is true —
+and reported the whole span as replaced without reading a byte.  Text output
+was refined afterwards by the line diff, so nothing showed; binary output has
+nothing afterwards, so a six-byte change to a 35 MB file was reported as
+35 MB of differing region, in 0.002s.  It now finds what the two spans still
+share and reports only the rest, at the cost of reading what has to be
+compared to find it.  That is `cmp -l`'s answer to the byte: 12 bytes at
+0x219b655 against the whole file.
+
+Two lessons, and the second is the one to carry: the coarse-answer failure
+mode hides in the paths with *no* downstream refinement, and the way to find
+it is to look at what the tool prints for a small change in a large file and
+ask whether a person could act on it.
 
 ## 10. A length difference skipped the byte comparison (0685481)
 

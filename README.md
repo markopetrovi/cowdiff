@@ -103,6 +103,15 @@ offsets, which are already known from the extent map, so it keeps the win.
 The price is output that `patch(1)` cannot consume and a header that a reader
 could mistake for line numbers.
 
+**Binary mode reads what it needs to locate the change.** Where there is
+sharing, the gap is small and almost nothing is read — 0.37% of the bytes on
+the reflinked pair above. Where there is not, and the two files differ in
+length, there is no alignment to compare against, so the ends they still have
+in common are found by reading forward to the first difference and back from
+the end. That is what turns "the whole file differs" into "12 bytes at
+0x219b655 differ", and it is the same trade the text path makes for its line
+numbers: the answer is only as precise as what was read to get it.
+
 **Without sharing, it is close to `diff` and sometimes ahead.** Measured at
 equal context against `diff -U0`, on files larger than any cache:
 
