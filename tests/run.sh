@@ -1,9 +1,11 @@
 #!/bin/bash
 # Compare cowdiff's text output against GNU diff on a spread of edits.
 #
-# The hunk bodies and headers have to match exactly; the only permitted
-# difference is that diff(1) stamps a timestamp after each filename and we do
-# not, so those are stripped before comparing.
+# The whole output has to match, headers and timestamps included: diff(1)
+# writes each file's mtime after a tab on its ---/+++ lines and so do we, and
+# comparing the two byte for byte is what keeps that true.  (Until it did,
+# this script stripped the timestamps from diff's side to make the comparison
+# work -- which meant nothing here tested what a header actually contained.)
 set -u
 
 # diff(1) is localised; compare against its C-locale output.
@@ -25,7 +27,7 @@ chk() {
 	if cmp -s "$A" "$B"; then
 		printf 'Files %s and %s are identical\n' "$A" "$B" > "$exp"
 	else
-		diff -u "$A" "$B" | sed -e 's/^\(---\|+++\) \([^\t]*\)\t.*/\1 \2/' > "$exp"
+		diff -u "$A" "$B" > "$exp"
 	fi
 	"$COW" "$A" "$B" > "$act" 2>"$WORK/.err"
 
@@ -170,8 +172,7 @@ chk "three lines inserted" A.txt B.txt
 
 # --- context lines, matching diff -U ----------------------------------------
 for n in 0 1 2 3 7; do
-	LC_ALL=C diff -U"$n" A.txt B.txt |
-		sed -e 's/^\(---\|+++\) \([^\t]*\)\t.*/\1 \2/' > "$WORK/.expected"
+	LC_ALL=C diff -U"$n" A.txt B.txt > "$WORK/.expected"
 	"$COW" -U"$n" A.txt B.txt > "$WORK/.actual"
 	if cmp -s "$WORK/.expected" "$WORK/.actual"; then
 		pass=$((pass + 1))
@@ -203,8 +204,7 @@ echo only > R1/extra
 echo x > R1/sub/deep;       echo y > R2/sub/deep
 echo z > R1/sub/only1
 
-LC_ALL=C diff -ru R1 R2 |
-	sed -e 's/^\(---\|+++\) \([^\t]*\)\t.*/\1 \2/' > "$WORK/.expected"
+LC_ALL=C diff -ru R1 R2 > "$WORK/.expected"
 "$COW" -r R1 R2 > "$WORK/.actual"
 if cmp -s "$WORK/.expected" "$WORK/.actual"; then
 	pass=$((pass + 1))

@@ -14,6 +14,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 /* Lines of context around each hunk, as in diff -U. */
@@ -22,6 +24,28 @@ static unsigned int context_lines = 3;
 void text_diff_set_context(int n)
 {
 	context_lines = n < 0 ? 0u : (unsigned int)n;
+}
+
+/*
+ * A ---/+++ header line, carrying the file's timestamp the way diff(1) does:
+ * after a tab, as "YYYY-MM-DD HH:MM:SS.NNNNNNNNN +ZZZZ".  A drop-in should
+ * put the same thing there, and a script that reads the header -- or a person
+ * reading a diff -- expects it.  patch(1) ignores it either way.
+ */
+static void print_file_header(const char *path, int fd, const char *mark)
+{
+	struct stat st;
+	struct tm tm;
+	char date[32], zone[8];
+
+	if (fstat(fd, &st) == 0 && localtime_r(&st.st_mtime, &tm) != NULL) {
+		strftime(date, sizeof date, "%Y-%m-%d %H:%M:%S", &tm);
+		strftime(zone, sizeof zone, "%z", &tm);
+		printf("%s %s\t%s.%09ld %s\n", mark, path, date,
+		       (long)st.st_mtim.tv_nsec, zone);
+	} else {
+		printf("%s %s\n", mark, path);
+	}
 }
 
 bool is_binary(int fd)
@@ -784,7 +808,8 @@ int emit_text_diff(const char *path_a, const char *path_b, int fd_a, int fd_b,
 			continue;
 
 		if (!header_done) {
-			printf("--- %s\n+++ %s\n", path_a, path_b);
+			print_file_header(path_a, fd_a, "---");
+			print_file_header(path_b, fd_b, "+++");
 			header_done = true;
 		}
 		if (i > first) {
