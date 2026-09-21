@@ -71,7 +71,7 @@ Nothing here is about test files. It is the property the tool is built around.
 
 Run before and after every change:
 
-    ./tests/run.sh                                        # 36 checks
+    ./tests/run.sh                                        # 47 checks
     python3 tests/extentcheck.py ./cowdiff ./tests/probe  # 16 checks
 
 - `tests/run.sh` compares text output against GNU diff byte for byte across
