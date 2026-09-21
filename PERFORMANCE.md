@@ -62,8 +62,8 @@ Concretely, this is why each of these is the way it is:
 The same standard applies in the line diff, and it is easy to break there
 without noticing: a *class number* may only be issued once the two lines'
 bytes have been compared, and a range may only be split at a pair that has
-been compared. See §7 and §11 — both are places where the proof is what makes
-a heuristic safe.
+been compared. See §7, §9 and §10 — all three are places where the proof is
+what makes a heuristic safe.
 
 Nothing here is about test files. It is the property the tool is built around.
 
@@ -79,7 +79,7 @@ Run before and after every change:
   against `diff -ru`, and runs `tests/bytecheck.py` for `--byte-offsets`.
   Two further checks cover files with no unique lines, where more than one
   answer is correct and the property tested is instead that the diff applied
-  to A rebuilds B (§11).
+  to A rebuilds B (§9).
 - `tests/extentcheck.py` covers the paths where the extent map rather than the
   byte comparison decides the answer: compressed extents, a shifted share
   built with `FICLONERANGE`, punched holes, zeros against a hole, inline
@@ -87,7 +87,7 @@ Run before and after every change:
   in use **skip loudly** rather than passing quietly — a test that silently
   stops testing its named path is worse than no test.
 - **A new test must be checked against the binary it is meant to catch.** Both
-  of the §11 tests were run against the previous binary first; the first
+  of the §9 tests were run against the previous binary first; the first
   version of one of them passed against it, and was not testing anything.
 
 `tests/bytecheck.py` asserts the two things that matter for `--byte-offsets`:
@@ -104,21 +104,24 @@ within one session, not absolutes across sessions.
 
 | shape | diff -u | before | after |
 |---|---|---|---|
-| reflinked + one change | 0.08 | 0.111 | **0.037** |
-| scattered changes | 0.64 | 0.208 | **0.119** |
-| no unique lines | 0.42 | 1.165 | **0.623** |
-| unrelated | 1.11 | 1.722 | **1.056** |
-| one change | 0.08 | 0.422 | 0.342 |
-| scattered + length change | 0.67 | 1.267 | 1.053 |
-| line inserted near the top | 0.07 | 0.334 | 0.299 |
-| identical, unshared | 0.08 | 0.013 | 0.013 |
+| reflinked + one change | 0.08 | 0.111 | **0.036** |
+| identical, unshared | 0.08 | 0.013 | **0.014** |
+| scattered changes | 0.65 | 0.208 | **0.121** |
+| line inserted near the top | 0.08 | 0.334 | **0.018** |
+| one change | 0.09 | 0.422 | **0.050** |
+| unrelated | 1.12 | 1.722 | **1.037** |
+| no unique lines | 0.42 | 1.165 | 0.579 |
+| scattered + length change | 0.65 | 1.267 | 1.013 |
 
-Ahead of GNU diff on the case the tool exists for, and on scattered changes;
-level on unrelated. Behind where almost nothing lines up, which is what the
-anchor search costs.
+Ahead of GNU diff on six of the eight, including the two that were more than
+4× behind before §10. The two it still loses are the two where the whole file
+is genuinely one delta — every line of "scattered + length change" differs,
+and "no unique lines" has nothing to anchor on — so the line search really
+does have to run over all of it.
 
 Already done, newest first:
 
+    0685481  Trim a delta to the part that differs before diffing it
     e11d53a  Add a benchmark harness that can see a few percent
     cb309b5  Let the newline counts vectorise
     2250ed0  Hash lines a word at a time, and print through a buffer
@@ -188,7 +191,7 @@ that match nothing in the other file before searching, and `too_expensive`
   different and much harder shape. This hid a working optimisation until the
   fixture was fixed.
 - **`sed` preserves a missing final newline; `awk` adds one.** A regression
-  test for §11 was written with `sed`, which made the two files agree at the
+  test for §9 was written with `sed`, which made the two files agree at the
   end, which meant the case it was written for never arose — it passed against
   the broken binary. If a fixture is meant to have a differing last line, build
   it with `awk`.
@@ -249,13 +252,13 @@ The other two changes in this target, both from the same profile:
   stdio calls per line. It now uses `memchr` and a private buffer.
 
 What is left here: on the reflinked shape the count is still 94% of the
-runtime, though of a much smaller number (0.034s) — see §12.
+runtime, though of a much smaller number (0.034s) — see §13.
 
 Target 2's own shapes are done. What the flag subtraction in §5 showed was
 not, in the end, where the remaining time goes on the other slow shapes:
 `-U0` minus `--byte-offsets` is only 12% on "one change", and the profile puts
 66% in `lineset_build` for a reason that has nothing to do with line numbers
-(§12).
+(§10).
 
 ## 9. A give-up that was worse than the bug it avoided (885a2b8)
 
@@ -287,7 +290,42 @@ direction of error, but an answer that is technically true and practically
 useless is its own kind of failure, and this one was in the fallback path
 where nobody was looking.
 
-## 10. Constraints a change here must not break
+## 10. A length difference skipped the byte comparison (0685481)
+
+`resolve_gap()` reports a gap whose two spans differ in length as one replaced
+span *without comparing any bytes at all*.  For binary output that is the
+honest answer and the right call.  For text output it meant the whole file
+became a single delta and the line diff had to rediscover the common prefix at
+line granularity: 66% of the "one change" shape was `lineset_build`, reading
+and hashing 70 MB to find a difference in the last line of one file, because
+the replacement was six bytes shorter and so nothing after it lined up.
+
+`--force-binary` is how to see it — it prints one region covering all
+35239522 bytes and runs in 0.002s, which is proof that nothing was read.
+
+The fix trims the delta's two line-snapped spans to the region that actually
+differs before building the linesets.  Two constraints, both easy to get
+wrong, and the second is the subtle one:
+
+  * each side must be cut on one of its own line boundaries, or the lineset
+    starts or ends inside a line;
+  * both sides must give up the *same number of bytes*.  The lines left
+    outside the two regions are then the same lines, which is what lets the
+    diff ignore them; cut them by different amounts and it reports trailing
+    lines as deleted that are not.
+
+The prefix satisfies both for free — its bytes are equal, so a line boundary
+in one file is a line boundary in the other — and the cut goes back to the
+start of the line the first difference is on.  The suffix is cut forward to
+the first whole line inside it, for the same reason.
+
+Measured, minimum CPU of 9 paired runs: "one change" 0.330s → 0.050s, "line
+inserted near the top" 0.290s → 0.017s.  Both went from more than 4× slower
+than `diff(1)` to faster than it.  The other six shapes were unchanged, which
+is the result worth checking — this only touches deltas the byte level
+skipped.
+
+## 11. Constraints a change here must not break
 
 - Section 2's invariant, above all.
 - **Build expensive structures lazily.** Eager building made the easy shapes
@@ -304,40 +342,29 @@ where nobody was looking.
   numbering, the hash and the renumbering all change internal representations
   and none of them may change a byte of output.
 
-## 11. Revert strategy
+## 12. Revert strategy
 
 Each optimisation is its own commit and they are independent, so a failed
 attempt is `git revert <commit>`, or a reset to the commit before it. Nothing
 has ever been pushed; this is a local repository only.
 
-## 12. Not done
-
-- **A length difference throws away the byte comparison.**
-  `resolve_gap()` reports a gap whose two spans differ in length as one
-  replaced span *without comparing any bytes* — the right call for binary
-  output, where it is the honest answer, but for text output it means the
-  entire file becomes a single delta and the line diff has to rediscover the
-  common prefix at line granularity. `--force-binary` on the one-change pair
-  prints one region covering all 35239522 bytes and runs in 0.002s, which is
-  the proof that nothing was read. The line diff then builds linesets over
-  both whole files, and `lineset_build` is 66% of that shape's profile.
-
-  Two of the four shapes where this tool is still slower than diff are
-  entirely this: "one change" (0.342s against diff's 0.08) and "line inserted
-  near the top" (0.299s against 0.07). Both differ from their partner only in
-  length.
-
-  The fix to try: before building the linesets, trim the common byte prefix
-  and suffix of the delta, snapped out to line boundaries, so the line diff
-  runs over the region that actually differs. On these two shapes that region
-  is a line or two out of 2.8M. Verify byte-identical output afterwards —
-  the trimmed region must land on the same alignment the recursive trimming
-  would have chosen, and that is not obvious enough to assume.
+## 13. Not done
 
 - On the reflinked shape the newline count is still 94% of the runtime,
   though of a much smaller number (0.034s): roughly 32 MB of `pread` to reach
   a hunk near the end of the file. The vectorised count should manage that in
   a few ms, so something else in that path is worth a look (§8).
+- The `GROUP_MAX` cap in `classes_assign` has never run. Reaching it needs 64
+  distinct lines sharing one 32-bit fingerprint, which is not reachable by
+  accident and would take a crafted file.
+- There is no randomized testing. The 36 checks in `tests/run.sh` are
+  hand-built shapes, and §9's bug — the worst one found so far — lived in a
+  fallback path that no hand-built shape exercised. A differential fuzz
+  against GNU diff, using "applying the output to A rebuilds B" as the
+  oracle rather than a byte-for-byte match, is the obvious next thing to
+  build.
+- Files with more than 2^31 lines would truncate a line index; `struct lref`
+  and `struct cent` before it both store it in 32 bits.
 - The `---`/`+++` header has no timestamp, where `diff(1)` writes the file's
   mtime after a tab. `tests/run.sh` strips it before comparing. Nobody has
   established whether that was a decision or an omission; `patch(1)` ignores
