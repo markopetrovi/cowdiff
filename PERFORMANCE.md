@@ -266,7 +266,8 @@ The other two changes in this target, both from the same profile:
   stdio calls per line. It now uses `memchr` and a private buffer.
 
 What is left here: on the reflinked shape the count is still 94% of the
-runtime, though of a much smaller number (0.034s) — see §13.
+runtime, though of a much smaller number — 0.034s when this was written and
+0.019s since 4754824.  See §13 for what is left of it.
 
 Target 2's own shapes are done. What the flag subtraction in §5 showed was
 not, in the end, where the remaining time goes on the other slow shapes:
