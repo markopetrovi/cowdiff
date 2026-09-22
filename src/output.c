@@ -771,9 +771,20 @@ static int range_to_bedits(struct beditlist *bl, int fd_a, int fd_b,
 	 * this way.  A pure insertion or deletion, or content that moved, is
 	 * exactly the case where the alignment is *not* known and the search
 	 * is what finds it.
+	 *
+	 * The line numbers are not known here: they are counted once for the
+	 * whole list further down, and only when the headers will name lines.
+	 * Zeroing them is what the line-diff path below does with `r`, and
+	 * leaving them out is a struct with four indeterminate fields in it --
+	 * every element's are overwritten before any of them is read, so it
+	 * changes no answer, but it is a genuine uninitialized read (and the
+	 * one `-Werror` caught when the build moved to -O3, which inlines far
+	 * enough to see it).
 	 */
-	if (a_len == b_len && a_off == b_off)
+	if (a_len == b_len && a_off == b_off) {
+		e.a_line = e.a_end_line = e.b_line = e.b_end_line = 0;
 		return bedit_push(bl, e);
+	}
 
 	/*
 	 * Everything else arrives here without its bytes having been compared,
