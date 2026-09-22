@@ -19,8 +19,9 @@ physically shared — reflinks, btrfs snapshots, deduplicated blocks — is neve
 read. A physical address names content rather than position, so a range of A
 and a range of B resolving to the same address hold equal bytes even when they
 sit at different file offsets; the offset delta is itself the insertion or
-deletion. Everything a proof does not cover becomes a gap, and only gaps are
-read.
+deletion. (A chain of such matches is a correct alignment, not a verdict —
+§16 is the one case where that distinction cost a wrong answer.) Everything a
+proof does not cover becomes a gap, and only gaps are read.
 
     make            # builds ./cowdiff and tests/probe
     make check      # tests/run.sh, then tests/extentcheck.py
@@ -156,8 +157,9 @@ Ahead of GNU diff on six of the eight, including the two that were more than
 4× behind before §10. The two it still loses are the two where the whole file
 is genuinely one delta — every line of "scattered + length change" differs,
 and "no unique lines" has nothing to anchor on — so the line search really
-does have to run over all of it.  Compare at equal context: those rows are
-`cowdiff -U0` against `diff -u`, and `diff -U0` is the fair partner.
+does have to run over all of it.  The rows above are `cowdiff -U0` against
+`diff -u`, which is not equal context and flatters this tool; the equal-context
+numbers are two paragraphs below.
 
 `-q` stops at the first difference it proves (0d4e5c9), which is the one
 place the walk may be cut short: on 64 MB of unrelated equal-sized files,
@@ -229,7 +231,9 @@ Two flags isolate phases with no instrumentation at all:
 - `--force-binary` runs the extent work and the byte comparison only. It is
   **0.00s on every slow shape** — so all remaining cost is line-level work,
   never I/O or extent handling. Check this first; it redirects the search
-  every time.
+  every time. (§16's crossed shares are the exception the shape list now has:
+  the same length and the matches at differing offsets, so the comparison is
+  the work.)
 - `--byte-offsets` does the line diff but skips the line-number scan, so
   `-U0` minus `--byte-offsets` is what line numbers cost. That subtraction is
   what showed the scan was 98% of the reflinked case (§8).
@@ -276,16 +280,19 @@ that match nothing in the other file before searching, and `too_expensive`
   fixtures is a twelve-second detour (519 MB, 11.9s here).
 - **A fixture has to check the layout it got, not the layout it asked for.**
   Nothing about the *content* makes this filesystem share extents; how the bytes
-  were written decides.  Coreutils 9 copies through `copy_file_range()` wherever
-  it can — plain `cp`, and `cat` when its output is a regular file, which is not
-  obvious — and btrfs implements that as a reflink, so those writes land on the
-  source's blocks: `shared`, and zero exclusive bytes in `btrfs filesystem du`.
-  A write through the page cache (`dd`, python's `write()`,
-  `cp --reflink=never`) allocates its own extents instead, identical content or
-  not.  So a case that needs a crossed or an unshared arrangement must read the
-  extents back and *skip loudly* if it got something else, which
-  `case_crossed_share` and `case_shifted_equal_span` do (§16).  To make a share,
-  say so: `tests/probe clone` performs `FICLONERANGE`.
+  were written decides.  A *copy* asks the filesystem to copy, and btrfs's copy
+  is a reflink, so a copy lands on the source's blocks (`shared`, and zero
+  exclusive bytes in `btrfs filesystem du`).  Two ways in, and the second is the
+  one that catches people: `cp` asks for it with the `FICLONE` ioctl (coreutils'
+  `--reflink` default, so ordinary `cp a b` is enough), and `cat` gets it from
+  `copy_file_range()` whenever its output is a regular file — `cat R R > X` is
+  not a command anyone thinks of as making a copy, let alone a reflink.  A write
+  through the page cache allocates its own extents instead, identical content or
+  not: `dd`, python's `write()`, `cp --reflink=never`.  So a case that needs a
+  crossed or an unshared arrangement must read the extents back and *skip
+  loudly* if it got something else, which `case_crossed_share` and
+  `case_shifted_equal_span` do (§16).  To make a share deliberately, say so:
+  `tests/probe clone` performs `FICLONERANGE`.
 - **`/tmp` is tmpfs here.**  `FICLONERANGE` returns ENOTSUP there and FIEMAP
   reports one untrusted extent, so a fixture built outside the repo runs down
   the unshared path and tests nothing it names.  Build them under the repo —
@@ -659,9 +666,9 @@ shapes), and neither gets a wrong answer to save time.
   the pair; so does this now, with the same status.
 
 One thing deliberately left alone: `-r` still has no `--` (end of options), so
-a file whose name begins with `-` cannot be named. It is the only remaining
-case where an argument diff accepts is refused, and it is a small addition if
-anyone needs it. (A second divergence turned up while testing §16: `diff -ru
+a file whose name begins with `-` cannot be named. That is the one case left
+where a *name* diff accepts is refused, and it is a small addition if anyone
+needs it. (A second divergence turned up while testing §16: `diff -ru
 FILE DIR` goes looking for `DIR/FILE` and compares that pair, where this refuses
 the invocation. The refusal is deliberate — it is not a comparison this tool has
 an answer for — and the message says why.)
@@ -680,7 +687,8 @@ reading anything*, and those are exactly the gaps a shifted chain leaves:
 on the alignment's word alone. So a chain at a shifted alignment is not merely
 coarser than the best one, it is wrong — and one is easy to build:
 
-    A := R||R, written in two calls so the two blocks are separate extents
+    A := R||R, written plainly, so each half has an address of its own
+         (written by a copy instead, both halves would be one block: §6)
     B := clone A[4096..8192) into B[0];  clone A[0..4096) into B[4096]
     cmp A B        -> identical
     cowdiff -q A B -> "Files A and B differ", exit 1, having read 0 bytes

@@ -40,15 +40,14 @@ take about twenty seconds doing it.
 
    A chain is not by itself a verdict. A match at differing offsets proves the
    *content* is equal, not that those bytes agree where they sit — and where
-   they sit is what
-   "identical" means. Two files of the same length whose shares are crossed
-   (A's block at one offset shared with B's at another, and vice versa) can
-   only be chained out of shifted matches, and the gaps such a chain leaves are
-   one-sided insertions, which are reported as differences without being read.
-   So when the two files are the same length, matches at differing offsets are
-   dropped and their ranges compared instead. When the lengths differ the
-   length already settles the verdict, and the shifted matches stay, because
-   they are what saves reading the tail after an insertion.
+   they sit is what "identical" means. Two files of the same length whose shares
+   are crossed (A's block at one offset shared with B's at another, and vice
+   versa) can only be chained out of shifted matches, and the gaps such a chain
+   leaves are one-sided insertions, which are reported as differences without
+   being read. So when the two files are the same length, matches at differing
+   offsets are dropped and their ranges compared instead. When the lengths
+   differ the length already settles the verdict, and the shifted matches stay,
+   because they are what saves reading the tail after an insertion.
 
 4. **Gaps.** Whatever is left between anchors. Holes and unwritten extents
    need no read. A hole against data is settled by testing the data side for
@@ -84,9 +83,9 @@ that no byte that differs is left out of them.
 `tests/fuzz.py` builds pairs at random and tests the properties that hold of
 *every* correct answer rather than comparing against a shape — first among them
 that a verdict of "identical" really means the bytes are equal.
-`PERFORMANCE.md` §3 lists the oracles and the shapes.
-A few hundred cases run in seconds; `--cases` and `--seeds` ask for more, a
-failure keeps its two files, and one seed reproduces it exactly.
+`PERFORMANCE.md` §3 lists the oracles and the shapes. A few hundred cases run in
+seconds; `--cases` and `--seeds` ask for more, a failure keeps its two files,
+and one seed reproduces it exactly.
 
 `tests/bench.sh` times a shape-by-shape overview and `tests/measure.py` is for
 numbers — it repeats each command and, when comparing two binaries, pairs them,

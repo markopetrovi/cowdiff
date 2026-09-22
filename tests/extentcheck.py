@@ -322,9 +322,12 @@ def case_crossed_share():
     direction, but it is still a wrong answer, and it is the one an exit status
     carries.
 
-    Built by cloning A's two halves into B in the other order.  They have to be
-    written in two calls: one write of both makes the filesystem share the
-    blocks with each other inside A, and then there is nothing to cross.
+    Built by cloning A's two halves into B in the other order, which needs each
+    half to have an address of its own -- true of a plain write however many
+    calls it takes, but not of a copy: `cp` and `cat` reflink the source block
+    into both halves and there is then nothing to cross (§6 of the notes).  So
+    the layout is read back below rather than assumed, and the case skips if it
+    is not the one it names.
     """
     name = "crossed share (FICLONERANGE at a different offset)"
     a, b = fx("x_a.bin"), fx("x_b.bin")
@@ -401,8 +404,10 @@ def case_shifted_equal_span():
     A = S1|M|S2 and B = PAD|S1|M|S2, with S1 and S2 cloned from A one block
     further along.  The middle block has to be a copy that is *not* shared, or
     it becomes an ordinary match at identical offsets and the gap it should
-    leave does not exist; writing it in place afterwards gives it an extent of
-    its own holding the same bytes.
+    leave does not exist.  Writing it in place is what guarantees that: it
+    holds whatever the file was built from, where a plain write would have left
+    the two middles distinct anyway and a copy (§6) would have shared them.  The
+    layout is read back below either way.
     """
     name = "shifted span that is byte-identical"
     a, b = fx("e_a.bin"), fx("e_b.bin")
