@@ -11,6 +11,7 @@
 #define _GNU_SOURCE
 #include "cowdiff.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -67,8 +68,8 @@ bool is_binary(int fd)
 int emit_binary_diff(const char *path_a, const char *path_b,
 		     const struct deltalist *dl)
 {
-	unsigned long long only_a = 0, only_b = 0;
-	size_t i;
+	unsigned long long only_a = 0, only_b = 0, unread = 0;
+	size_t i, nunread = 0;
 
 	if (dl->n == 0) {
 		printf("Files %s and %s are identical\n", path_a, path_b);
@@ -78,14 +79,47 @@ int emit_binary_diff(const char *path_a, const char *path_b,
 	for (i = 0; i < dl->n; i++) {
 		only_a += dl->v[i].a_len;
 		only_b += dl->v[i].b_len;
+		if (dl->v[i].unreadable) {
+			nunread++;
+			unread += dl->v[i].a_len;
+		}
 	}
 
 	printf("Binary files %s and %s differ\n", path_a, path_b);
 	printf("%zu differing region%s (%llu bytes in %s, %llu bytes in %s)\n",
 	       dl->n, dl->n == 1 ? "" : "s", only_a, path_a, only_b, path_b);
+	/*
+	 * Said separately and in full, because "could not be read" is not the
+	 * same finding as "holds different bytes": it is a difference only
+	 * because equality could not be proven there, and whoever reads this
+	 * needs to know which of the two they have.
+	 */
+	if (nunread)
+		printf("%zu region%s (%llu bytes) could not be read: "
+		       "input/output error, so not shown to match\n",
+		       nunread, nunread == 1 ? "" : "s", unread);
 
 	for (i = 0; i < dl->n; i++) {
 		const struct delta *d = &dl->v[i];
+
+		if (d->unreadable) {
+			const char *where = d->unreadable == UNREAD_AB
+						    ? "both files"
+						    : (d->unreadable & UNREAD_A
+							       ? path_a : path_b);
+
+			if (d->a_off == d->b_off && d->a_len == d->b_len)
+				printf("  unreadable  both at 0x%llx, %llu bytes (input/output error in %s)\n",
+				       (unsigned long long)d->a_off,
+				       (unsigned long long)d->a_len, where);
+			else
+				printf("  unreadable  %s[0x%llx, %llu bytes] -> %s[0x%llx, %llu bytes] (input/output error in %s)\n",
+				       path_a, (unsigned long long)d->a_off,
+				       (unsigned long long)d->a_len, path_b,
+				       (unsigned long long)d->b_off,
+				       (unsigned long long)d->b_len, where);
+			continue;
+		}
 
 		if (d->a_len == 0)
 			printf("  inserted  %s[0x%llx, %llu bytes]\n", path_b,
@@ -121,11 +155,17 @@ struct lcounter {
 	int fd;
 	uint64_t off;
 	uint64_t lines;
+	bool blind;		/* a bad block was crossed: the count is a
+				 * lower bound, so no line number may be printed */
 };
 
 /*
  * The counting itself lives in count_newlines, which reads eight bytes per
  * step; this is only the reading and the running total.
+ *
+ * A block that cannot be read is skipped rather than refused: its newlines
+ * cannot be counted, so the total stops being a count and becomes a lower
+ * bound, which is recorded in `blind` and costs the caller its line numbers.
  */
 static int lc_count(struct lcounter *lc, uint64_t off, uint64_t *out)
 {
@@ -136,8 +176,13 @@ static int lc_count(struct lcounter *lc, uint64_t off, uint64_t *out)
 		uint64_t want = off - lc->off < sizeof buf ? off - lc->off
 							   : sizeof buf;
 
-		if (pread_full(lc->fd, buf, want, lc->off) < 0)
-			return -1;
+		if (pread_full(lc->fd, buf, want, lc->off) < 0) {
+			if (errno != EIO)
+				return -1;
+			lc->blind = true;
+			lc->off += want;
+			continue;
+		}
 		lines += count_newlines(buf, want);
 		lc->off += want;
 	}
@@ -592,23 +637,107 @@ static bool gap_is_close(int fd, uint64_t from, uint64_t to)
 	return p >= to;
 }
 
+/*
+ * Turn one byte range that differs into line ranges: snap it out to whole
+ * lines and let the line diff refine it.  Returns 0, or -1 with errno set --
+ * EIO meaning part of the range could not be read, which the caller reports
+ * as an unreadable region rather than dying on.
+ */
+static int range_to_bedits(struct beditlist *bl, int fd_a, int fd_b,
+			   const struct extmap *ma, const struct extmap *mb,
+			   uint64_t a_off, uint64_t a_len,
+			   uint64_t b_off, uint64_t b_len)
+{
+	struct bedit e;
+	struct lineset la, lb;
+	struct editlist el;
+	size_t k;
+
+	if (line_start(fd_a, a_off, &e.a_off) < 0 ||
+	    line_end(fd_a, a_off + a_len, ma->size, &e.a_end) < 0 ||
+	    line_start(fd_b, b_off, &e.b_off) < 0 ||
+	    line_end(fd_b, b_off + b_len, mb->size, &e.b_end) < 0)
+		return -1;
+
+	/*
+	 * A delta that came from comparing the same span of both files already
+	 * carries its own alignment: the bytes differ there and agree
+	 * everywhere else, so the changed lines are simply whatever those
+	 * bytes fall on.  Running a line diff would only rediscover that --
+	 * and on a file with many scattered changes the rediscovery is the
+	 * entire cost, because the search reads the whole range at every level
+	 * of its recursion.
+	 *
+	 * Only a delta of the same length at the same offset can be trusted
+	 * this way.  A pure insertion or deletion, or content that moved, is
+	 * exactly the case where the alignment is *not* known and the search
+	 * is what finds it.
+	 */
+	if (a_len == b_len && a_off == b_off)
+		return bedit_push(bl, e);
+
+	/*
+	 * Everything else arrives here without its bytes having been compared,
+	 * so work out how much of the two spans is actually common before
+	 * reading them in full.
+	 */
+	if (span_trim(fd_a, &e.a_off, &e.a_end, fd_b, &e.b_off, &e.b_end) < 0)
+		return -1;
+
+	if (lineset_build(&la, fd_a, e.a_off, e.a_end - e.a_off) < 0)
+		return -1;
+	if (lineset_build(&lb, fd_b, e.b_off, e.b_end - e.b_off) < 0) {
+		lineset_free(&la);
+		return -1;
+	}
+	if (linediff(&la, &lb, &el) < 0) {
+		lineset_free(&la);
+		lineset_free(&lb);
+		return -1;
+	}
+
+	for (k = 0; k < el.n; k++) {
+		struct bedit r;
+
+		r.a_off = ls_off(&la, e.a_off, el.v[k].alo);
+		r.a_end = ls_off(&la, e.a_off, el.v[k].ahi);
+		r.b_off = ls_off(&lb, e.b_off, el.v[k].blo);
+		r.b_end = ls_off(&lb, e.b_off, el.v[k].bhi);
+		r.a_line = r.a_end_line = r.b_line = r.b_end_line = 0;
+
+		if (bedit_push(bl, r) < 0) {
+			edits_free(&el);
+			lineset_free(&la);
+			lineset_free(&lb);
+			return -1;
+		}
+	}
+
+	edits_free(&el);
+	lineset_free(&la);
+	lineset_free(&lb);
+	return 0;
+}
+
 int emit_text_diff(const char *path_a, const char *path_b, int fd_a, int fd_b,
 		   const struct extmap *ma, const struct extmap *mb,
 		   const struct deltalist *dl, bool byte_offsets)
 {
 	struct beditlist bl;
 	struct lcounter ca, cb;
+	struct range { uint64_t off, end; } *bad = NULL;
+	size_t nbad = 0, cap_bad = 0;
+	char *touches = NULL;
+	size_t nunread = 0;
 	size_t i, first;
 	bool header_done = false;
 	int rc = -1;
 
 	memset(&bl, 0, sizeof bl);
+	memset(&ca, 0, sizeof ca);
+	memset(&cb, 0, sizeof cb);
 	ca.fd = fd_a;
-	ca.off = 0;
-	ca.lines = 0;
 	cb.fd = fd_b;
-	cb.off = 0;
-	cb.lines = 0;
 
 	if (dl->n == 0)
 		return 0;
@@ -619,83 +748,80 @@ int emit_text_diff(const char *path_a, const char *path_b, int fd_a, int fd_b,
 	 * block is often far smaller at line granularity than a byte-level
 	 * comparison can tell.
 	 */
-	for (i = 0; i < dl->n; i++) {
-		const struct delta *d = &dl->v[i];
-		struct bedit e;
-		struct lineset la, lb;
-		struct editlist el;
-		size_t k;
+	/*
+	 * Which deltas can go through the line diff at all.  A range that could
+	 * not be read has no lines to diff -- snapping it to line boundaries
+	 * means reading around it, let alone splitting it into lines -- and
+	 * neither has a delta that merely *overlaps* one, since the line diff
+	 * reads its whole span and the unreadable block sits inside it.  Both
+	 * kinds are reported afterwards in byte offsets, where they cannot be
+	 * mistaken for a line-level finding.
+	 */
+	if (dl->n) {
+		size_t k = 0;
 
-		if (line_start(fd_a, d->a_off, &e.a_off) < 0 ||
-		    line_end(fd_a, d->a_off + d->a_len, ma->size, &e.a_end) < 0 ||
-		    line_start(fd_b, d->b_off, &e.b_off) < 0 ||
-		    line_end(fd_b, d->b_off + d->b_len, mb->size, &e.b_end) < 0)
-			goto out;
+		for (i = 0; i < dl->n; i++) {
+			const struct delta *d = &dl->v[i];
 
-		/*
-		 * A delta that came from comparing the same span of both files
-		 * already carries its own alignment: the bytes differ there and
-		 * agree everywhere else, so the changed lines are simply
-		 * whatever those bytes fall on.  Running a line diff would only
-		 * rediscover that -- and on a file with many scattered changes
-		 * the rediscovery is the entire cost, because the search reads
-		 * the whole range at every level of its recursion.
-		 *
-		 * Only a delta of the same length at the same offset can be
-		 * trusted this way.  A pure insertion or deletion, or content
-		 * that moved, is exactly the case where the alignment is *not*
-		 * known and the search is what finds it.
-		 */
-		if (d->a_len == d->b_len && d->a_off == d->b_off) {
-			if (bedit_push(&bl, e) < 0)
-				goto out;
-			continue;
-		}
-
-		/*
-		 * Everything above the fast path arrives here without its bytes
-		 * having been compared, so work out how much of the two spans
-		 * is actually common before reading them in full.
-		 */
-		if (span_trim(fd_a, &e.a_off, &e.a_end, fd_b, &e.b_off,
-			      &e.b_end) < 0)
-			goto out;
-
-		if (lineset_build(&la, fd_a, e.a_off, e.a_end - e.a_off) < 0)
-			goto out;
-		if (lineset_build(&lb, fd_b, e.b_off, e.b_end - e.b_off) < 0) {
-			lineset_free(&la);
-			goto out;
-		}
-		if (linediff(&la, &lb, &el) < 0) {
-			lineset_free(&la);
-			lineset_free(&lb);
-			goto out;
-		}
-
-		for (k = 0; k < el.n; k++) {
-			struct bedit r;
-
-			r.a_off = ls_off(&la, e.a_off, el.v[k].alo);
-			r.a_end = ls_off(&la, e.a_off, el.v[k].ahi);
-			r.b_off = ls_off(&lb, e.b_off, el.v[k].blo);
-			r.b_end = ls_off(&lb, e.b_off, el.v[k].bhi);
-			r.a_line = r.a_end_line = r.b_line = r.b_end_line = 0;
-
-			if (bedit_push(&bl, r) < 0) {
-				edits_free(&el);
-				lineset_free(&la);
-				lineset_free(&lb);
-				goto out;
+			if (d->unreadable) {
+				if (nbad == cap_bad) {
+					size_t ncap = cap_bad ? cap_bad * 2 : 64;
+					struct range *nv = realloc(bad,
+							ncap * sizeof *nv);
+					if (!nv)
+						goto out;
+					bad = nv;
+					cap_bad = ncap;
+				}
+				bad[nbad].off = d->a_off;
+				bad[nbad].end = d->a_off + d->a_len;
+				nbad++;
 			}
 		}
+		touches = calloc(dl->n, 1);
+		if (!touches)
+			goto out;
+		for (i = 0; i < dl->n; i++) {
+			const struct delta *d = &dl->v[i];
+			uint64_t o = d->a_off, e = d->a_off + d->a_len;
 
-		edits_free(&el);
-		lineset_free(&la);
-		lineset_free(&lb);
+			while (k < nbad && bad[k].end <= o)
+				k++;
+			if (k < nbad && bad[k].off < e)
+				touches[i] = 1;
+		}
 	}
 
-	if (bl.n == 0) {
+	for (i = 0; i < dl->n; i++) {
+		const struct delta *d = &dl->v[i];
+		int rc2;
+
+		if (touches[i])
+			continue;         /* reported in bytes, below */
+
+		rc2 = range_to_bedits(&bl, fd_a, fd_b, ma, mb, d->a_off, d->a_len,
+				      d->b_off, d->b_len);
+		if (rc2 < 0) {
+			if (errno != EIO)
+				goto out;
+			/*
+			 * A block inside this range could not be read, and the byte
+			 * level never saw it -- a delta whose two sides differ in
+			 * length is reported without being compared, and reading
+			 * around it to find line boundaries is what failed.  The
+			 * range is reported as unreadable rather than diffed: what
+			 * is left of it cannot be shown to match either, and the
+			 * line diff cannot span a gap whose contents are unknown.
+			 */
+			touches[i] = 1;
+		}
+	}
+
+	for (i = 0; i < dl->n; i++)
+		if (touches[i])
+			nunread++;
+
+	if (bl.n == 0 && nunread == 0) {
 		rc = 0;
 		goto out;
 	}
@@ -714,6 +840,23 @@ int emit_text_diff(const char *path_a, const char *path_b, int fd_a, int fd_b,
 			    lc_count(&cb, bl.v[i].b_end,
 				     &bl.v[i].b_end_line) < 0)
 				goto out;
+		}
+
+		/*
+		 * A line number is a count of newlines from the start of the
+		 * file, and a block that cannot be read cannot be counted.  The
+		 * numbers from there on would be quietly wrong, which is the
+		 * one thing an output like this must not be, so the hunks are
+		 * given byte offsets instead -- the numbers a reader can trust
+		 * -- and the reason is said out loud.
+		 */
+		if (ca.blind || cb.blind) {
+			fprintf(stderr,
+				"cowdiff: could not read all of %s; "
+				"line numbers would be wrong, so hunk headers "
+				"carry byte offsets\n",
+				ca.blind ? path_a : path_b);
+			byte_offsets = true;
 		}
 	}
 
@@ -751,14 +894,59 @@ int emit_text_diff(const char *path_a, const char *path_b, int fd_a, int fd_b,
 					: emit_hunk(fd_a, fd_b, ma->size, &bl,
 						    first, i - 1);
 
-			if (r < 0)
-				goto out;
+			if (r < 0) {
+				if (errno != EIO)
+					goto out;
+				printf("cowdiff: unreadable context at "
+				       "0x%llx -- input/output error, hunk "
+				       "not shown\n",
+				       (unsigned long long)bl.v[first].a_off);
+			}
 		}
 		first = i;
 	}
 
+	/*
+	 * Regions that could not be read, last and plainly marked.  They are
+	 * differences because equality there was not established, not because
+	 * anything was seen to differ, and the line below deliberately is not
+	 * a diff line: an output that quietly omitted a region, or that looked
+	 * patchable while missing one, would be worse than an obvious note
+	 * that it is not.
+	 */
+	if (nunread) {
+		if (!header_done) {
+			print_file_header(path_a, fd_a, "---");
+			print_file_header(path_b, fd_b, "+++");
+			header_done = true;
+		}
+		for (i = 0; i < dl->n; i++) {
+			const struct delta *d = &dl->v[i];
+
+			if (!touches[i])
+				continue;
+			printf("cowdiff: unreadable %s[0x%llx, %llu bytes] vs "
+			       "%s[0x%llx, %llu bytes] -- input/output error, "
+			       "so not shown to match%s\n",
+			       path_a, (unsigned long long)d->a_off,
+			       (unsigned long long)d->a_len, path_b,
+			       (unsigned long long)d->b_off,
+			       (unsigned long long)d->b_len,
+			       d->unreadable == UNREAD_AB ? " (neither side)"
+			       : d->unreadable ? " (one side)" : "");
+		}
+		fprintf(stderr,
+			"cowdiff: %zu region%s could not be read (input/output "
+			"error); they are reported as differences, and no diff "
+			"line describes them, so this output is not a patch of "
+			"the whole difference\n",
+			nunread, nunread == 1 ? "" : "s");
+	}
+
 	rc = header_done ? 1 : 0;
 out:
+	free(bad);
+	free(touches);
 	free(bl.v);
 	return rc;
 }

@@ -137,7 +137,21 @@ int anchors_find(const struct extmap *a, const struct extmap *b,
 struct delta {
 	uint64_t a_off, a_len;
 	uint64_t b_off, b_len;
+	unsigned int unreadable;	/* UNREAD_*, which sides could not be read */
 };
+
+/*
+ * A range that could not be read.  It is reported as a difference because
+ * equality there cannot be *proven*, and the rule in the header of delta.c
+ * is that anything unproven is a difference -- the same rule that makes
+ * DELALLOC and inline extents get read rather than trusted.  It is a
+ * different *kind* of difference though, so the output says which side
+ * failed rather than pretending the bytes were compared.
+ */
+#define UNREAD_NONE 0u
+#define UNREAD_A 1u
+#define UNREAD_B 2u
+#define UNREAD_AB (UNREAD_A | UNREAD_B)
 
 struct deltalist {
 	struct delta *v;

@@ -11,6 +11,7 @@
  */
 #include "cowdiff.h"
 
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -46,8 +47,16 @@ int common_prefix(int fd_a, uint64_t a, int fd_b, uint64_t b, uint64_t limit,
 		uint64_t i;
 
 		if (pread_full(fd_a, ba, want, a + k) < 0 ||
-		    pread_full(fd_b, bb, want, b + k) < 0)
+		    pread_full(fd_b, bb, want, b + k) < 0) {
+			/* A bad block ends the trim where it stands.  The
+			 * rest stays in the region, gets compared, and is
+			 * reported as unreadable if it cannot be read. */
+			if (errno == EIO) {
+				*out = k;
+				return 0;
+			}
 			return -1;
+		}
 		if (memcmp(ba, bb, want) == 0) {
 			k += want;
 			continue;
@@ -75,8 +84,13 @@ int common_suffix(int fd_a, uint64_t a_end, int fd_b, uint64_t b_end,
 		uint64_t i;
 
 		if (pread_full(fd_a, ba, want, a_end - k - want) < 0 ||
-		    pread_full(fd_b, bb, want, b_end - k - want) < 0)
+		    pread_full(fd_b, bb, want, b_end - k - want) < 0) {
+			if (errno == EIO) {	/* as in common_prefix */
+				*out = k;
+				return 0;
+			}
 			return -1;
+		}
 		if (memcmp(ba, bb, want) == 0) {
 			k += want;
 			continue;
@@ -105,15 +119,23 @@ static bool deltas_full(const struct deltalist *dl)
 	return dl->n >= DELTA_MAX;
 }
 
-/* Adjacent deltas that touch in both files are really one bigger delta. */
-static int deltas_push(struct deltalist *dl, uint64_t a_off, uint64_t a_len,
-		       uint64_t b_off, uint64_t b_len)
+/*
+ * Adjacent deltas that touch in both files are really one bigger delta --
+ * unless they are different in kind.  A region that was compared and a region
+ * that could not be read are both differences, but they are not the same
+ * claim, and merging them would make the report say more than was
+ * established.
+ */
+static int deltas_push_flags(struct deltalist *dl, uint64_t a_off,
+			     uint64_t a_len, uint64_t b_off, uint64_t b_len,
+			     unsigned int unreadable)
 {
 	if (dl->n) {
 		struct delta *last = &dl->v[dl->n - 1];
 
 		if (last->a_off + last->a_len == a_off &&
-		    last->b_off + last->b_len == b_off) {
+		    last->b_off + last->b_len == b_off &&
+		    last->unreadable == unreadable) {
 			last->a_len += a_len;
 			last->b_len += b_len;
 			return 0;
@@ -135,19 +157,126 @@ static int deltas_push(struct deltalist *dl, uint64_t a_off, uint64_t a_len,
 		.a_len = a_len,
 		.b_off = b_off,
 		.b_len = b_len,
+		.unreadable = unreadable,
 	};
 	return 0;
 }
 
+static int deltas_push(struct deltalist *dl, uint64_t a_off, uint64_t a_len,
+		       uint64_t b_off, uint64_t b_len)
+{
+	return deltas_push_flags(dl, a_off, a_len, b_off, b_len, UNREAD_NONE);
+}
+
+/* A range that could not be read, so equality cannot be proven. */
+static int deltas_push_unreadable(struct deltalist *dl, uint64_t a_off,
+				  uint64_t a_len, uint64_t b_off, uint64_t b_len,
+				  unsigned int unreadable)
+{
+	return deltas_push_flags(dl, a_off, a_len, b_off, b_len, unreadable);
+}
+
 /*
- * Read both sides of an equal-length span and record the runs that differ.
- * This is the only place the tool reads two buffers and compares them.
- *
- * Returns 0 having walked the span, 1 having stopped because `stop` was set
- * and a difference had been recorded, or -1 on error.  Stopping is sound
- * because a difference that has been *compared* proves the files differ,
- * while the opposite verdict is the one that has to be earned.
+ * Record the runs that differ between two buffers already in memory.
+ * `p` is the absolute offset the buffers start at and `n` their length;
+ * `left` is how much of the span remains, which is what a delta that has to
+ * give up (deltas_full) covers.  Returns 0, 1 having stopped because `stop`
+ * was set and a difference was recorded, or -1 on error.
  */
+static int diff_buffers(const unsigned char *ba, const unsigned char *bb,
+			uint64_t p, size_t n, struct deltalist *out, bool stop,
+			uint64_t left)
+{
+	size_t i = 0;
+
+	if (memcmp(ba, bb, n) == 0)
+		return 0;
+
+	if (deltas_full(out)) {
+		if (deltas_push(out, p, left, p, left) < 0)
+			return -1;
+		return stop ? 1 : 0;
+	}
+
+	while (i < n) {
+		size_t start, end;
+		unsigned int gap = 0;
+
+		while (i < n && ba[i] == bb[i])
+			i++;
+		if (i == n)
+			break;
+
+		start = i;
+		end = i;
+		while (i < n) {
+			if (ba[i] != bb[i]) {
+				i++;
+				end = i;
+				gap = 0;
+			} else {
+				if (++gap > MERGE_GAP)
+					break;
+				i++;
+			}
+		}
+
+		if (deltas_push(out, p + start, end - start,
+				p + start, end - start) < 0)
+			return -1;
+		if (stop)
+			return 1;
+	}
+	return 0;
+}
+
+/*
+ * Compare one chunk whose bulk read failed, a block at a time.
+ *
+ * A read that returns EIO means the storage underneath is damaged, and a
+ * block that cannot be read cannot be shown to be equal -- so it is recorded
+ * as a difference, which is the direction every other ambiguity in this tool
+ * resolves towards.  Doing it a block at a time is the point of being here:
+ * one bad block costs one block of report rather than the whole chunk, and
+ * the readable blocks around it are still compared rather than assumed.
+ */
+#define EIO_BLOCK 4096
+
+static int compare_chunk_with_holes(int fd_a, int fd_b, uint64_t p, size_t n,
+				    unsigned char *ba, unsigned char *bb,
+				    struct deltalist *out, bool stop)
+{
+	size_t k;
+
+	for (k = 0; k < n; k += EIO_BLOCK) {
+		size_t m = n - k < EIO_BLOCK ? n - k : EIO_BLOCK;
+		int ea = pread_full(fd_a, ba, m, p + k) < 0 ? errno : 0;
+		int eb = pread_full(fd_b, bb, m, p + k) < 0 ? errno : 0;
+		unsigned int unread = UNREAD_NONE;
+		int rc;
+
+		if ((ea && ea != EIO) || (eb && eb != EIO))
+			return -1;	/* a real error, not a bad block */
+		if (ea)
+			unread |= UNREAD_A;
+		if (eb)
+			unread |= UNREAD_B;
+		if (unread) {
+			if (deltas_push_unreadable(out, p + k, m, p + k, m,
+						  unread) < 0)
+				return -1;
+			if (stop)
+				return 1;
+			continue;
+		}
+
+		rc = diff_buffers(ba, bb, p + k, m, out, stop, m);
+		if (rc != 0)
+			return rc;
+	}
+	return 0;
+}
+
 static int compare_range(int fd_a, int fd_b, uint64_t off, uint64_t len,
 			 unsigned char *ba, unsigned char *bb, size_t cap,
 			 struct deltalist *out, bool stop)
@@ -157,54 +286,19 @@ static int compare_range(int fd_a, int fd_b, uint64_t off, uint64_t len,
 	while (p < off + len) {
 		uint64_t left = off + len - p;
 		size_t n = left < cap ? (size_t)left : cap;
-		size_t i;
+		int rc;
 
-		if (pread_full(fd_a, ba, n, p) < 0)
-			return -1;
-		if (pread_full(fd_b, bb, n, p) < 0)
-			return -1;
-
-		if (memcmp(ba, bb, n) == 0) {
-			p += n;
-			continue;
-		}
-
-		if (deltas_full(out)) {
-			if (deltas_push(out, p, left, p, left) < 0)
+		if (pread_full(fd_a, ba, n, p) < 0 ||
+		    pread_full(fd_b, bb, n, p) < 0) {
+			if (errno != EIO)
 				return -1;
-			return stop ? 1 : 0;
+			rc = compare_chunk_with_holes(fd_a, fd_b, p, n, ba, bb,
+						      out, stop);
+		} else {
+			rc = diff_buffers(ba, bb, p, n, out, stop, left);
 		}
-
-		i = 0;
-		while (i < n) {
-			size_t start, end;
-			unsigned int gap = 0;
-
-			while (i < n && ba[i] == bb[i])
-				i++;
-			if (i == n)
-				break;
-
-			start = i;
-			end = i;
-			while (i < n) {
-				if (ba[i] != bb[i]) {
-					i++;
-					end = i;
-					gap = 0;
-				} else {
-					if (++gap > MERGE_GAP)
-						break;
-					i++;
-				}
-			}
-
-			if (deltas_push(out, p + start, end - start,
-					p + start, end - start) < 0)
-				return -1;
-			if (stop)
-				return 1;
-		}
+		if (rc != 0)
+			return rc;
 
 		p += n;
 	}
@@ -252,9 +346,20 @@ static int gap_equal_range(int fd_a, const struct extmap *ma,
 			const struct extmap *m = za ? mb : ma;
 			bool z;
 
-			if (range_is_zero(fd, m, p, next - p, scratch, &z) < 0)
+			rc = range_is_zero(fd, m, p, next - p, scratch, &z);
+			if (rc < 0)
 				return -1;
-			if (!z) {
+			if (rc > 0) {
+				/* The data side could not be read, so whether
+				 * it is zeros is unknowable -- a difference. */
+				if (deltas_push_unreadable(out, p, next - p,
+							  p, next - p,
+							  za ? UNREAD_B
+							     : UNREAD_A) < 0)
+					return -1;
+				if (stop)
+					return 1;
+			} else if (!z) {
 				if (deltas_push(out, p, next - p, p, next - p) < 0)
 					return -1;
 				if (stop)

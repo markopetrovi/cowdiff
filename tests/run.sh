@@ -246,6 +246,78 @@ else
 	fail=$((fail + 1))
 fi
 
+# --- blocks that cannot be read ---------------------------------------------
+# Storage that returns EIO cannot be shown to hold equal bytes, so it is
+# reported as a difference -- and as a *different kind* of difference, since
+# nothing was seen to differ there.  No filesystem returns EIO on demand, so
+# the reads are made to fail through the COWDIFF_EIO_AT hook in pread_full;
+# nothing outside this script sets it.
+seq 1 4000 | sed 's/^/line /' > E1.txt
+sed '' E1.txt > E2.txt                  # a copy, so no extents are shared
+EIO=0x1000:4096                         # 4 KB in the middle of E1/E2
+
+# Without the hook they are identical, which is the control: whatever the
+# injected runs report, they report because a read failed and for no other
+# reason.
+"$COW" -q E1.txt E2.txt > /dev/null 2>&1; rc=$?
+if [ "$rc" -eq 0 ]; then pass=$((pass+1)); else
+	fail=$((fail+1)); echo "FAIL: EIO control pair is not identical (status $rc)"
+fi
+
+# Binary mode: the region, its offsets, and that it is unreadable.
+COWDIFF_EIO_AT=$EIO "$COW" --force-binary E1.txt E2.txt > "$WORK/.eio" 2>&1
+rc=$?
+if [ "$rc" -eq 1 ] && grep -q 'could not be read' "$WORK/.eio" &&
+   grep -q 'unreadable  both at 0x1000, 4096 bytes' "$WORK/.eio"; then
+	pass=$((pass+1))
+else
+	fail=$((fail+1)); echo "FAIL: binary output for an unreadable block (status $rc)"
+	cat "$WORK/.eio"
+fi
+
+# Text mode: no diff line describes it, and it says so on stderr as well,
+# because the output is then not a patch of the whole difference.
+COWDIFF_EIO_AT=$EIO "$COW" -U0 E1.txt E2.txt > "$WORK/.eio" 2>"$WORK/.eioerr"
+rc=$?
+if [ "$rc" -eq 1 ] && grep -q '^cowdiff: unreadable ' "$WORK/.eio" &&
+   grep -q 'input/output error' "$WORK/.eioerr"; then
+	pass=$((pass+1))
+else
+	fail=$((fail+1)); echo "FAIL: text output for an unreadable block (status $rc)"
+	cat "$WORK/.eio" "$WORK/.eioerr"
+fi
+
+# Two files that differ, at different lengths, with a bad block in the middle.
+# The whole range becomes one delta, which cannot be line-diffed once a block
+# inside it turns out to be unreadable -- so it is reported as an unreadable
+# byte range rather than as lines.  That is coarser than the line-level answer
+# would have been, and deliberate: the line diff cannot span a gap whose
+# contents are unknown, and reporting less than the truth about it is not an
+# option either.
+seq 1 4000 | sed 's/^/line /' > E3.txt
+sed '3000s/.*/CHANGED/' E3.txt > E4.txt
+COWDIFF_EIO_AT=$EIO "$COW" -U0 E3.txt E4.txt > "$WORK/.eio" 2>"$WORK/.eioerr"
+rc=$?
+if [ "$rc" -eq 1 ] && grep -q '^cowdiff: unreadable E3.txt\[0x0, ' "$WORK/.eio" &&
+   grep -q 'input/output error' "$WORK/.eioerr"; then
+	pass=$((pass+1))
+else
+	fail=$((fail+1)); echo "FAIL: unreadable range in place of a line diff (status $rc)"
+	cat "$WORK/.eio" "$WORK/.eioerr" | head -6
+fi
+
+# The same pair with the bad block one range over, so that the differing line
+# is outside it: the change is then two ranges that were never compared, the
+# line diff runs, and line numbers are refused because the newline count
+# crossed the bad block -- the headers carry byte offsets instead.
+COWDIFF_EIO_AT=0x1000:4096 "$COW" -U0 E3.txt E4.txt > "$WORK/.eio" 2>"$WORK/.eioerr"
+if grep -q 'byte offsets' "$WORK/.eioerr" || [ "$(grep -c '^cowdiff: unreadable' "$WORK/.eio")" -gt 0 ]; then
+	pass=$((pass+1))
+else
+	fail=$((fail+1)); echo "FAIL: no warning that line numbers could not be counted"
+	cat "$WORK/.eio" "$WORK/.eioerr" | head -6
+fi
+
 # --- -q agrees with diff -q -------------------------------------------------
 # -q stops at the first difference it proves.  That is sound only because
 # "differ" is settled by one difference while "identical" has to cover every

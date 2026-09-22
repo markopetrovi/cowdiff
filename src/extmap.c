@@ -373,9 +373,45 @@ void iobuf_free(struct iobuf *b)
 
 uint64_t cowdiff_bytes_read;
 
+/*
+ * A test hook, and only that: pretend the storage under a range is damaged so
+ * the unreadable-block path can be exercised without a damaged disk.  No
+ * filesystem can be asked to return EIO on demand, and a test for this
+ * behaviour that needs a failing drive is a test nobody runs.
+ *
+ * Set COWDIFF_EIO_AT="offset:length" (C syntax, so 0x... works).  Nothing but
+ * tests/run.sh sets it.
+ */
+static bool faulted(uint64_t off, size_t len)
+{
+	static bool ready;
+	static uint64_t at, end;
+	const char *s;
+	char *p;
+
+	if (!ready) {
+		ready = true;
+		s = getenv("COWDIFF_EIO_AT");
+		if (s && *s) {
+			at = strtoull(s, &p, 0);
+			if (*p == ':') {
+				end = at + strtoull(p + 1, NULL, 0);
+			} else {
+				at = end = 0;
+			}
+		}
+	}
+	return end > at && off < end && at < off + len;
+}
+
 int pread_full(int fd, void *buf, size_t len, uint64_t off)
 {
 	unsigned char *p = buf;
+
+	if (faulted(off, len)) {
+		errno = EIO;
+		return -1;
+	}
 
 	while (len > 0) {
 		ssize_t r = pread(fd, p, len, (off_t)off);
@@ -383,10 +419,15 @@ int pread_full(int fd, void *buf, size_t len, uint64_t off)
 		if (r < 0) {
 			if (errno == EINTR)
 				continue;
+			return -1;	/* errno says why: EIO is a bad block */
+		}
+		if (r == 0) {
+			/* Short read: the range asked for runs past the end, so
+			 * the caller mis-sized it.  Distinct from EIO on
+			 * purpose -- one is a damaged file, the other a bug. */
+			errno = ERANGE;
 			return -1;
 		}
-		if (r == 0)
-			return -1;	/* short read: caller mis-sized it */
 		cowdiff_bytes_read += (uint64_t)r;
 		p += r;
 		off += (uint64_t)r;
@@ -426,8 +467,14 @@ int range_is_zero(int fd, const struct extmap *m, uint64_t off, uint64_t len,
 		if (chunk == 0)
 			break;
 
-		if (pread_full(fd, scratch->p, chunk, off) < 0)
+		if (pread_full(fd, scratch->p, chunk, off) < 0) {
+			/* A bad block is not zeros, and it is not something
+			 * that can be shown to be zeros either.  Say so rather
+			 * than failing the run; the caller reports it. */
+			if (errno == EIO)
+				return 1;
 			return -1;
+		}
 		if (memcmp(scratch->p, scratch->zero, chunk) != 0) {
 			*out = false;
 			return 0;
