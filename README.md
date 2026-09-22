@@ -69,10 +69,11 @@ offsets differing by the insert size — is to insert the bytes the ordinary way
 and then re-clone the tail from the original.
 
 `tests/extentcheck.py` covers the paths where the extent map rather than the
-byte comparison decides the answer: compressed extents, shifted shares,
-punched holes, zeros against a hole, a hole followed by data, inline extents,
-unwritten extents. Fixtures that cannot be built on the filesystem in use skip
-loudly rather than passing quietly.
+byte comparison decides the answer — the ones whose fixtures have to make the
+filesystem do something specific. `PERFORMANCE.md` §3 lists the cases and what
+each one asserts. Fixtures that cannot be built on the filesystem in use skip
+loudly rather than passing quietly, including two that skip on the *layout*
+they got rather than on the filesystem itself.
 
 `tests/deltacheck.py` covers what happens once the list of differing regions
 fills up, which takes a pair of files tens of megabytes long: past a cap the
@@ -81,11 +82,10 @@ that the regions do not overlap, that none runs past the end of a file, and
 that no byte that differs is left out of them.
 
 `tests/fuzz.py` builds pairs at random and tests the properties that hold of
-*every* correct answer rather than comparing against a shape: that
-"identical" means the bytes really are equal, that the text output applied to
-the first file rebuilds the second, that the exit status agrees with `diff`,
-and that binary mode reports every difference without overlapping itself. A
-few hundred cases run in seconds; `--cases` and `--seeds` ask for more, a
+*every* correct answer rather than comparing against a shape — first among them
+that a verdict of "identical" really means the bytes are equal.
+`PERFORMANCE.md` §3 lists the oracles and the shapes.
+A few hundred cases run in seconds; `--cases` and `--seeds` ask for more, a
 failure keeps its two files, and one seed reproduces it exactly.
 
 `tests/bench.sh` times a shape-by-shape overview and `tests/measure.py` is for
@@ -202,13 +202,9 @@ An insertion with a re-shared tail is reported without reading the tail, but
 reaching that state takes an explicit `FICLONERANGE`.
 
 **A share that sits at different offsets is compared, not trusted, when the
-two files are the same length.** The same content cloned into different offsets
-in the two files can be aligned two ways — offset for offset, or content for
-content — and only the first answers "are these the same bytes *here*". So the
-crossed matches are dropped, and everything the same-offset matches do not
-already cover is read and compared: one region, or the whole file when none of
-them survives. Where the lengths differ the tool still answers from the
-addresses alone, which is the case the insertion above is about.
+two files are the same length.** Everything the same-offset matches do not
+already cover is then read and compared: one region, or the whole file when
+none of them survives. (Step 3 above says why.)
 
 **Storage that cannot be read is reported, not skipped.** A block that returns
 EIO cannot be shown to hold equal bytes, so it is reported as a difference —

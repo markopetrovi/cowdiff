@@ -176,36 +176,6 @@ should measure it again first: four of the six shared shapes agreed to within a
 few percent when the two tables were compared, and two had drifted far enough
 that the difference cannot be attributed without a fresh run.
 
-Already done, newest first:
-
-    e0b903c  Fix four bugs, and five smaller things
-    e33d557  Two things the review of 019907e turned up
-    3855ed7  Order the notes properly
-    e5723a9  Document what happens when a block cannot be read
-    019907e  Carry on when a block cannot be read
-    a8a4502  Add a license, and point at the notes from the README
-    703cc7b  Correct what the benchmark says diff does with binary files
-    0e406b5  Correct the check count in the gate
-    8d3754f  Document that the binary path no longer reports whole spans
-    f8e232a  Report what a shifted span shares, not the whole span
-    23f0a3e  Fix a stale figure cross-referenced from §8
-    7c72730  Bring the handoff notes up to date
-    3d2de4c  Update the limits section for where the tool now stands
-    4754824  Count newlines eight bytes at a time
-    7e186aa  Benchmark the binary and -q paths
-    e10f74f  Write the file's timestamp in the ---/+++ header, as diff does
-    29a926b  Note the -q shortcut in the handoff notes
-    0d4e5c9  Let -q stop at the first difference it proves
-    95e4f22  Record the delta trim, and fix the notes' numbering
-    0685481  Trim a delta to the part that differs before diffing it
-    39b081e  Update the handoff notes for where things now stand
-    e11d53a  Add a benchmark harness that can see a few percent
-    cb309b5  Let the newline counts vectorise
-    2250ed0  Hash lines a word at a time, and print through a buffer
-    885a2b8  Split at the middle when nothing is unique, instead of giving up
-    720950b  Assign line classes by sorting, not by hashing
-    db11c4b  Compare line classes, not line text
-
 ## 5. Method — read this before touching performance
 
 **Profile first. Six separate predictions about where the time went were
