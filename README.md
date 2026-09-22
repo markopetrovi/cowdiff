@@ -127,6 +127,7 @@ absolutes.
       -U NUM               lines of context around each change (default 3)
       -u, --unified        accepted and ignored; unified is the only format
           --dump-extents   print the extent map and exit
+      -h, --help           the options, and this summary of the exit status
 
 Exit status follows `diff`: 0 identical, 1 different, 2 error.
 

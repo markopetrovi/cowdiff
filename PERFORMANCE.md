@@ -103,8 +103,8 @@ Run before and after every change:
   the two files in the other order, which is what let a shifted chain decide a
   verdict (§16) — a gap between two shifted matches whose spans are
   byte-identical, punched holes, zeros against a hole, a hole followed by
-  data, inline extents, unwritten extents, and `--dump-extents` on one file
-  named twice. Fixtures that cannot be built on the filesystem in use **skip
+  data, a hole followed by an extent of zeros, inline extents, unwritten
+  extents, and `--dump-extents` on one file named twice. Fixtures that cannot be built on the filesystem in use **skip
   loudly** rather than passing quietly — a test that silently stops testing its
   named path is worse than no test. Two of them skip on a layout rather than a
   filesystem, because whether a block ends up shared depends on how the file was

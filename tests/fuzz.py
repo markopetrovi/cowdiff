@@ -292,9 +292,11 @@ def run_case(cow, rng, tag, args):
         write_spec(pb, sb, size)
         same_offsets = True                # unshared, equal length
     elif mode == "same-length":
-        # Incompressible, swapped one byte at a time: enough separate runs of
-        # differing bytes to fill the delta list, which is where the coarse
-        # fallback lives (§15.3).
+        # Incompressible, the same length on both sides, with a few thousand
+        # single-byte differences strewn through it: the same-offset comparison
+        # and its run merging, in binary output.  Not the delta *cap* -- that
+        # needs 262144 runs (DELTA_MAX), so tests/deltacheck.py is what reaches
+        # the coarse fallback (§13), on files of eight megabytes and up.
         n = rng.choice([8192, 65536, 300000])
         a = bytearray(rng.randbytes(n))
         b = bytearray(a)
