@@ -5,6 +5,7 @@
 
 # test scratch -- the test scripts and the fuzz recreate their own fixtures
 /.testtmp/
+__pycache__/
 
 # benchmark scratch -- tests/bench.sh recreates these, and they are large
 /.bench/
