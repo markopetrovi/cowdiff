@@ -38,9 +38,9 @@ take about twenty seconds doing it.
    in either file. Any such chain is a correct alignment, so the selection can
    be greedy: a worse choice only means larger gaps to compare.
 
-   A chain is not by itself a verdict, and that distinction is one this tool
-   got wrong. A match at differing offsets proves the *content* is equal, not
-   that those bytes agree where they sit — and where they sit is what
+   A chain is not by itself a verdict. A match at differing offsets proves the
+   *content* is equal, not that those bytes agree where they sit — and where
+   they sit is what
    "identical" means. Two files of the same length whose shares are crossed
    (A's block at one offset shared with B's at another, and vice versa) can
    only be chained out of shifted matches, and the gaps such a chain leaves are

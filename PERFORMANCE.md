@@ -218,9 +218,11 @@ improvement.
 `perf annotate` plus `addr2line -e ./cowdiff -i -f 0xADDR` will name the exact
 line for a hot instruction, which is how the 36%-of-runtime load in §7's
 predecessor was found. For "is this loop vectorised", count SIMD instructions
-in the one function:
+in the function that holds the loop — `count_newlines` since 4754824 moved the
+counting out of `lc_count`, which now only reads and totals it. Under `-flto`
+the two are merged, so the same instructions turn up under `lc_count` instead:
 
-    objdump -d ./cowdiff | awk '/<lc_count>:/,/^$/' | grep -cE 'pcmpeqd|pmovmskb'
+    objdump -d ./cowdiff | awk '/<count_newlines>:/,/^$/' | grep -cE 'pcmpeqd|pmovmskb'
 
 Two flags isolate phases with no instrumentation at all:
 
@@ -272,6 +274,18 @@ that match nothing in the other file before searching, and `too_expensive`
   `make distclean` is what removes it, and `.testtmp/` with it.  `make clean`
   deliberately does not: it is run routinely between builds, and rebuilding the
   fixtures is a twelve-second detour (519 MB, 11.9s here).
+- **A fixture has to check the layout it got, not the layout it asked for.**
+  This filesystem (`compress=zstd:1`) shares identical blocks between files by
+  itself, and does not always do it: blocks written in one call are shared with
+  each other, two calls usually are not, and rewriting a block in place is the
+  only reliable way to get an extent of its own holding the same bytes.  A case
+  that needs a crossed or an unshared arrangement must read the extents back and
+  *skip loudly* if it got something else, which `case_crossed_share` and
+  `case_shifted_equal_span` do (§16).
+- **`/tmp` is tmpfs here.**  `FICLONERANGE` returns ENOTSUP there and FIEMAP
+  reports one untrusted extent, so a fixture built outside the repo runs down
+  the unshared path and tests nothing it names.  Build them under the repo —
+  `.testtmp/`, which `tests/run.sh` clears at startup.
 
 ## 7. Target 1 — length-changing scattered edits (done: 720950b)
 
@@ -728,41 +742,23 @@ provable from the addresses, so there is no read-free "identical" to be had
 there. README's promise that a shared block is never read needed "at the same
 offset" adding to it, in the limits section and in §14 above.
 
-**Fixtures, since they will be written again.** This filesystem
-(`compress=zstd:1`) shares identical blocks between files on its own, and does
-not always do it, so a fixture that needs a crossed or an unshared layout has
-to check the layout it got and skip loudly if it is something else —
-`case_crossed_share` and `case_shifted_equal_span` both do. Blocks written in
-one call are shared with each other; two calls are not; and rewriting a block
-in place gives it an extent of its own holding the same bytes, which is the only
-reliable way to get an unshared copy. And `/tmp` is tmpfs: `FICLONERANGE` is
-ENOTSUP there, so a fixture built outside the repo silently tests the unshared
-path instead of the one it names.
+Building a fixture for either of these has its own traps — what layout the
+filesystem actually gives you, and why `/tmp` is the wrong place to ask — and
+they are in §6 with the other traps of that kind.
 
-New tests, each run against the binary from before its fix: `crossed share
-(FICLONERANGE at a different offset)` and `shifted span that is byte-identical`
-in `tests/extentcheck.py` — 3 and 2 of their checks fail against the old binary
-— a `share` mode in `tests/fuzz.py` that builds crossed pairs at random, which
-fails on the status oracle against the old binary, and an oracle that no
-reported region may call equal bytes different.
+The tests are in §3's list with the rest of the gate: two new extent cases,
+each of them failing against the binary from before its fix, a `share` mode in
+the fuzz that builds crossed pairs at random, and the oracle that no reported
+region may call equal bytes different.
 
-Five smaller things went in with this. Four are checked, each against the
-binary from before its change: `-r` printed "are identical" for a pair that
-shares an inode, where `diff -ru` says nothing about a pair that matches; `-r`
-reported the other side's names as "Only in" when a listing had failed, which
-is a claim about a directory nothing was read from; `--dump-extents f f`
-printed a verdict instead of the map; and `--stats` was skipped for the
-same-inode pair, the one pair that reads nothing at all.
-
-The fifth has no test and is not expected to be reachable, and it is written
-down here so that nobody has to wonder why: `walk_dir()` dropped a level out of
-the ancestry chain it uses for symlink-loop detection when either `stat()`
-failed, leaving a hole that only a loop through that level would ever notice.
-Each side is now recorded on its own, which changes nothing observable — the
-walk only recurses into a pair whose two sides the caller has already stat'd —
-and is there for the same reason §15.1's `range_is_zero` fix is: the mistake is
-latent, the failure it would produce is silent, and a second caller is one
-function signature away. Kept, against the alternative of reverting it for
-being dead code, because it replaces a conditional rather than adding one and
-because "unknown" is a flag now instead of a value that dev and ino of zero
-could be confused with.
+Five smaller things went in alongside them: `-r` printing "are identical" for a
+pair that shares an inode, `-r` calling an unlistable directory empty on this
+side, `--dump-extents f f` printing a verdict instead of the map, `--stats`
+being skipped for the same-inode pair, and a level being dropped out of
+`walk_dir()`'s ancestry chain when one `stat()` of the pair failed.  The first
+four are checked the same way as the extent cases — §3 says what each asserts —
+and the fifth is the one that has no test, because the walk only recurses into
+a pair whose two sides the caller has already stat'd and no input reaches it.
+It is kept for the same reason §15.1's `range_is_zero` fix is: the mistake is
+latent, what it would produce is silent, and a second caller is one function
+signature away.  §11 carries it as a constraint, having nowhere better to be.
