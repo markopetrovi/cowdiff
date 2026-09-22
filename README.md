@@ -69,6 +69,14 @@ rest of the file is reported as one coarse substitution, and what it checks is
 that the regions do not overlap, that none runs past the end of a file, and
 that no byte that differs is left out of them.
 
+`tests/fuzz.py` builds pairs at random and tests the properties that hold of
+*every* correct answer rather than comparing against a shape: that
+"identical" means the bytes really are equal, that the text output applied to
+the first file rebuilds the second, that the exit status agrees with `diff`,
+and that binary mode reports every difference without overlapping itself. A
+few hundred cases run in seconds; `--cases` and `--seeds` ask for more, a
+failure keeps its two files, and one seed reproduces it exactly.
+
 `tests/bench.sh` times a shape-by-shape overview and `tests/measure.py` is for
 numbers — it repeats each command and, when comparing two binaries, pairs them,
 because a single run on a laptop varies by more than 2x.

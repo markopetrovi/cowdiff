@@ -22,7 +22,7 @@ deletion. Everything a proof does not cover becomes a gap, and only gaps are
 read.
 
     make            # builds ./cowdiff and tests/probe
-    make check      # tests/run.sh
+    make check      # tests/run.sh, then tests/extentcheck.py
 
 `README.md` documents the design and the limits for a user. This file is for
 whoever works on it next.
@@ -72,7 +72,7 @@ Nothing here is about test files. It is the property the tool is built around.
 Run before and after every change:
 
     make check                                            # both lines below
-    ./tests/run.sh                                        # 75 checks
+    ./tests/run.sh                                        # 76 checks
     python3 tests/extentcheck.py ./cowdiff ./tests/probe  # 22 checks
 
 - `tests/run.sh` compares text output against GNU diff byte for byte across
@@ -92,6 +92,15 @@ Run before and after every change:
   followed by data, inline extents, unwritten extents. Fixtures that cannot be
   built on the filesystem in use **skip loudly** rather than passing quietly —
   a test that silently stops testing its named path is worse than no test.
+- `tests/fuzz.py` builds pairs at random and checks what is true of every
+  correct answer rather than comparing against a shape: §2's invariant on
+  every case, the patch oracle, the exit status against `diff`, and binary
+  mode's report. Its seeds are the only source of variation, so a failure
+  reproduces from its seed (the failing pair is kept and the invocation
+  printed). Default is a few hundred cases and a couple of seconds;
+  `--cases`/`--seeds` ask for more, which is worth doing when the extent or
+  line machinery changes — both of §15's fuzz-found bugs were within the first
+  few hundred cases, and neither is a shape anyone had thought to write.
 - **A new test must be checked against the binary it is meant to catch.** Both
   of the §9 tests were run against the previous binary first; the first
   version of one of them passed against it, and was not testing anything.
@@ -137,6 +146,7 @@ identical files cost the same as they always did, and twice as fast as
 
 Already done, newest first:
 
+    e0b903c  Fix four bugs, and five smaller things
     e33d557  Two things the review of 019907e turned up
     3855ed7  Order the notes properly
     e5723a9  Document what happens when a block cannot be read
@@ -399,16 +409,14 @@ has ever been pushed; this is a local repository only.
 
 ## 13. Not done
 
-- There is no randomized testing *in the repository*. One was written for the
-  session that found §15's bugs, and it paid for itself inside a few hundred
-  cases: two of the four it found broke §2. It ran four oracles — `-q`
-  returning 0 must mean the bytes are equal, the `-U3` output applied to A
-  must rebuild B, the exit status must agree with `diff`, and every differing
-  byte must lie in a reported region — over shapes built to vary line
-  structure, sharing, sparseness and newline-at-EOF. The scripts were scratch
-  and are not in the tree; what they found is now covered by named regression
-  tests (see §15), and rebuilding the fuzz to look for the *next* one is still
-  the highest-value thing on this list.
+- The fuzz is `tests/fuzz.py` now (§15), seeded, a few hundred cases inside
+  `make check` and `--cases`/`--seeds` for a longer hunt. Two of §15's four
+  bugs were its first few hundred cases — that is the argument for running it
+  longer than the default whenever the extent or line machinery changes. What
+  it does *not* reach is worth knowing too: the delta list only fills on files
+  of eight megabytes and up, so that path is covered by `tests/deltacheck.py`
+  instead, and a cost that is merely quadratic is not an oracle at all — §15.4
+  was found by timing, not by fuzzing.
 - The `GROUP_MAX` cap in `classes_assign` has never run. Reaching it needs 64
   distinct lines sharing one 32-bit fingerprint, which is not reachable by
   accident and would take a crafted file.

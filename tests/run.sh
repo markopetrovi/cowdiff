@@ -330,6 +330,17 @@ else
 	fail=$((fail + 1))
 fi
 
+# --- the fuzz -----------------------------------------------------------------
+# Random pairs rather than named shapes, against the oracles that hold of every
+# correct answer -- see the file. It needs no fixtures of this script's, only a
+# binary, and a few hundred cases take a couple of seconds.
+echo "--- fuzz ---"
+if python3 "$ROOT/tests/fuzz.py" "$COW"; then
+	pass=$((pass + 1))
+else
+	fail=$((fail + 1))
+fi
+
 # --- blocks that cannot be read ---------------------------------------------
 # Storage that returns EIO cannot be shown to hold equal bytes, so it is
 # reported as a difference -- and as a *different kind* of difference, since
