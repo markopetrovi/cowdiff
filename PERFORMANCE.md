@@ -258,6 +258,9 @@ that match nothing in the other file before searching, and `too_expensive`
   everything is noise without repetition. See §5.
 - `.bench/` holds tens of MB of fixtures and **must stay in `.gitignore`**;
   400 MB of them were once committed and had to be filtered out of history.
+  `make distclean` is what removes it, and `.testtmp/` with it.  `make clean`
+  deliberately does not: it is run routinely between builds, and rebuilding the
+  fixtures is a twelve-second detour (519 MB, 11.9s here).
 
 ## 7. Target 1 — length-changing scattered edits (done: 720950b)
 
