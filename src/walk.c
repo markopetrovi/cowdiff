@@ -175,21 +175,16 @@ static void walk_dir(const char *pa, const char *pb, const struct level *up)
 		up = &here;
 	}
 
-	if (!la && !lb)
-		return;		/* both already complained about */
-	if (!la) {
-		/* Nothing to pair against; report the other side as unique. */
-		for (j = 0; j < nb; j++)
-			printf("Only in %s: %s\n", pb, lb[j]);
-		free_list(lb, nb);
-		note(1);
-		return;
-	}
-	if (!lb) {
-		for (i = 0; i < na; i++)
-			printf("Only in %s: %s\n", pa, la[i]);
+	/*
+	 * A listing that failed leaves nothing to pair against.  list_dir() has
+	 * already said what went wrong and set the status, and that is all
+	 * there is to say: every name the other side holds would otherwise come
+	 * out as "Only in <dir>", which is a claim about *this* directory that
+	 * was never established -- it may well hold all of them.
+	 */
+	if (!la || !lb) {
 		free_list(la, na);
-		note(1);
+		free_list(lb, nb);
 		return;
 	}
 

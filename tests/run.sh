@@ -299,6 +299,47 @@ else
 	head -3 "$WORK/.actual"
 fi
 
+# A directory that cannot be listed is a failure, not an empty directory.  The
+# names the other side holds were being reported as "Only in" it, which is a
+# claim about a directory that was never read -- it may hold every one of them.
+# Both shapes below reach the same path: a file where a directory was expected,
+# and a directory that refuses to open.
+#
+# The status here is 2 and diff's is not, deliberately: diff -ru FILE DIR goes
+# looking for DIR/FILE and compares that, which is a pair this tool does not
+# have an answer for, so it refuses the invocation instead.  What is being
+# tested is the refusal's *report*, so that is what is asserted.
+rm -rf U1 U2; mkdir -p U1 U2
+echo x > U1/f; echo y > U2/f; echo z > U2/only
+"$COW" -r U1/f U2 > "$WORK/.actual" 2>&1; got=$?
+if [ "$got" -eq 2 ] && ! grep -q '^Only in' "$WORK/.actual"; then
+	pass=$((pass + 1))
+else
+	fail=$((fail + 1))
+	echo "FAIL: -r with one side unlistable (status $got)"
+	cat "$WORK/.actual"
+fi
+
+# Mode 000 stops nobody when the suite runs as root, so the check follows diff
+# out of the way there rather than passing for the wrong reason.
+if [ "$(id -u)" -ne 0 ]; then
+	rm -rf P1 P2; mkdir -p P1/sub P2/sub
+	echo a > P1/sub/f; echo b > P2/sub/f; echo c > P2/sub/g
+	chmod 000 P1/sub
+	LC_ALL=C diff -ru P1 P2 > /dev/null 2>&1; want=$?
+	"$COW" -r P1 P2 > "$WORK/.actual" 2>&1; got=$?
+	chmod 755 P1/sub
+	if [ "$got" -eq "$want" ] && ! grep -q '^Only in' "$WORK/.actual"; then
+		pass=$((pass + 1))
+	else
+		fail=$((fail + 1))
+		echo "FAIL: -r into an unreadable directory (diff $want, cowdiff $got)"
+		cat "$WORK/.actual"
+	fi
+else
+	echo "note: running as root; the unreadable-directory check is skipped"
+fi
+
 # --stats describes the file it is printed for.  A running total across a -r
 # walk makes the second file's line claim the first one's bytes as well, and
 # on an unshared pair compared in binary mode the number is exactly the size
