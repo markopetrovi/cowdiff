@@ -176,6 +176,21 @@ should measure it again first: four of the six shared shapes agreed to within a
 few percent when the two tables were compared, and two had drifted far enough
 that the difference cannot be attributed without a fresh run.
 
+**The build flags are worth 15-30% on six of the eight shapes**, measured
+paired with `tests/measure.py --against` when the default `CFLAGS` moved to
+`-O3 -march=native` (medians of 5 and of 3 runs; `.bench/` has to exist, which
+`tests/bench.sh` builds).  Each flag carries part of it: holding `-march=native`
+and moving `-O2` to `-O3` gives 0.69-0.95 across the shapes, and holding `-O3`
+and adding `-march=native` gives 0.76-1.0.  Rows in the 0.93-1.0 range are
+inside the spread of samples this size and are not effects — one shape read as
+a 4.5% regression against `-O2` and is not one, which is §5's warning about
+single comparisons happening in miniature.  The two that `-march=native` pays
+most for are `scattered changes` (0.76) and `reflink + one change` (0.81), so
+dropping it for portability gives that back; the Makefile has an `install`
+target, and a binary built with it will not run on a CPU without this one's
+instructions.  `-march=x86-64-v3` or nothing at all is the trade for anyone
+shipping further than this machine.
+
 ## 5. Method — read this before touching performance
 
 **Profile first. Six separate predictions about where the time went were
