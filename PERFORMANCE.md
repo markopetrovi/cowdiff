@@ -407,6 +407,11 @@ skipped.
   two files of the same length is reached, and keep the gate that applies it —
   the gate is what leaves the read-free answer for an insertion whose tail was
   re-cloned, and applying it unconditionally would cost that.
+- **The build must stay warning-free.** `-Werror` is in the default `CFLAGS`,
+  so a new warning is a broken build rather than a line of output nobody reads.
+  Overriding `CFLAGS` drops it, which is what the sanitizer and `-O0` builds do;
+  the last warning this caught was a struct with four indeterminate fields,
+  visible only once `-O3` inlined enough to see it (§16's session).
 
 ## 12. Revert strategy
 
