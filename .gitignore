@@ -3,9 +3,8 @@
 /cowdiff
 /tests/probe
 
-# test scratch -- tests/run.sh recreates its own fixtures
+# test scratch -- the test scripts and the fuzz recreate their own fixtures
 /.testtmp/
-/cotest/
 
 # benchmark scratch -- tests/bench.sh recreates these, and they are large
 /.bench/
