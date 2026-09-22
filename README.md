@@ -96,12 +96,17 @@ because a single run on a laptop varies by more than 2x.
 `EIO`. It exists so the unreadable-block paths can be tested without a damaged
 disk, and nothing outside `tests/run.sh` sets it.
 
-**[`PERFORMANCE.md`](PERFORMANCE.md)** is the working notebook behind the
-numbers above: what each optimisation measured, and the wrong predictions that
-had to be measured to be corrected. Six of them so far. It also records the two
-bugs that were not slow but useless — a diff that claimed a million lines
-changed for a one-line edit, and a binary report that named the whole file —
-since "true" is not the same as "worth printing".
+**[`PERFORMANCE.md`](PERFORMANCE.md)** is the working notebook: what each
+optimisation measured, and the wrong predictions that had to be measured to be
+corrected. Six of them so far. It also records the bugs that were not slow but
+useless — a diff that claimed a million lines changed for a one-line edit, a
+binary report that named the whole file, a third that named byte-identical
+bytes as changed — since "true" is not the same as "worth printing".
+
+The tables here and in §4 measure against different baselines — this one at
+equal context, §4's against `diff -u` — and both come from the session that
+built the tool, so read them as ratios within a session, not as current
+absolutes.
 
 ## Usage
 
@@ -200,10 +205,10 @@ reaching that state takes an explicit `FICLONERANGE`.
 two files are the same length.** The same content cloned into different offsets
 in the two files can be aligned two ways — offset for offset, or content for
 content — and only the first answers "are these the same bytes *here*". So the
-crossed matches are dropped and the region between the surrounding matches is
-read and compared; the cost is that region, not the file. Where the lengths
-differ the tool still answers from the addresses alone, which is the case the
-insertion above is about.
+crossed matches are dropped, and everything the same-offset matches do not
+already cover is read and compared: one region, or the whole file when none of
+them survives. Where the lengths differ the tool still answers from the
+addresses alone, which is the case the insertion above is about.
 
 **Storage that cannot be read is reported, not skipped.** A block that returns
 EIO cannot be shown to hold equal bytes, so it is reported as a difference —
@@ -213,11 +218,11 @@ same offset* the block is never read at all, so damage underneath it costs
 nothing and the bytes are still proven equal; a share at differing offsets is
 compared rather than trusted when the lengths match, so damage there is
 reported like any other unreadable region. Two places are coarser than they
-would otherwise be: a
-delta that cannot be line-diffed because a block inside it is unreadable is
-reported as a byte range rather than as lines, and line numbers are given up
-for byte offsets when a newline count crosses an unreadable block. Both are
-coarser, neither is wrong, and both say so where they happen.
+would otherwise be: a delta that cannot be line-diffed because a block inside
+it is unreadable is reported as a byte range rather than as lines, and line
+numbers are given up for byte offsets when a newline count crosses an
+unreadable block. Both are coarser, neither is wrong, and both say so where
+they happen.
 
 **Two filesystems are not comparable.** Equal addresses from separate
 filesystems are a coincidence. Files are checked with `st_dev` first, then

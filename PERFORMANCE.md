@@ -59,11 +59,17 @@ Concretely, this is why each of these is the way it is:
   filesystems are coincidences. btrfs never sets `sb->s_uuid_len`, so the
   generic `FS_IOC_GETFSUUID` returns `ENOTTY` for it and `BTRFS_IOC_FS_INFO`
   is needed; subvolumes of one filesystem have different `st_dev`.
+- **A match at differing offsets may not decide the verdict.** An address
+  proves the *content* is equal, not that those bytes agree where they sit, and
+  the gaps a chain of shifted matches leaves are one-sided insertions, which
+  resolve without a read. So when the two files are the same length the shifted
+  matches are dropped and their ranges compared instead — §16 is the audit that
+  found what happens when they are not.
 
 The same standard applies in the line diff, and it is easy to break there
 without noticing: a *class number* may only be issued once the two lines'
 bytes have been compared, and a range may only be split at a pair that has
-been compared. See §7, §9 and §10 — all three are places where the proof is
+been compared. See §7, §9, §10 and §16 — all four are places where the proof is
 what makes a heuristic safe.
 
 Nothing here is about test files. It is the property the tool is built around.
@@ -104,10 +110,16 @@ Run before and after every change:
   not always do it (§16).
 - `tests/fuzz.py` builds pairs at random and checks what is true of every
   correct answer rather than comparing against a shape: §2's invariant on
-  every case, the patch oracle, the exit status against `diff`, and binary
-  mode's report. Its seeds are the only source of variation, so a failure
-  reproduces from its seed (the failing pair is kept and the invocation
-  printed). Default is a few hundred cases and a couple of seconds;
+  every case, the patch oracle, the exit status against `diff`, that no
+  reported region calls equal bytes different, and binary mode's report. Its
+  shapes are the line-structured ones, sparse files, a reflink rewritten in
+  place, and — since §16 — pairs built out of repeated blocks with some of them
+  cloned from a *different* occurrence of the same block, which is the only way
+  to reach a match at a shifted offset (it needs `tests/probe`, and the mode is
+  dropped when that is not built). Its seeds are the only source of variation,
+  so a failure reproduces from its seed (the failing pair is kept and the
+  invocation printed). Default is a few hundred cases and a few seconds — the
+  added oracle runs the binary once more per case, which is worth it;
   `--cases`/`--seeds` ask for more, which is worth doing when the extent or
   line machinery changes — both of §15's fuzz-found bugs were within the first
   few hundred cases, and neither is a shape anyone had thought to write.
@@ -153,6 +165,16 @@ place the walk may be cut short: on 64 MB of unrelated equal-sized files,
 "identical" — that verdict has to cover every byte not proven shared, so
 identical files cost the same as they always did, and twice as fast as
 `diff -q` because `diff -q` reads them too.
+
+The README quotes a second set of ratios, for the same shapes at *equal*
+context: `cowdiff -U0` against `diff -U0`, where the table above is against
+`diff -u` and so flatters this tool.  Equal context is the fairer of the two
+comparisons, and those figures live in the README because nothing here
+reproduces them — `tests/measure.py` pairs one binary against another at the
+same arguments, which neither comparison is.  Whoever quotes either set next
+should measure it again first: four of the six shared shapes agreed to within a
+few percent when the two tables were compared, and two had drifted far enough
+that the difference cannot be attributed without a fresh run.
 
 Already done, newest first:
 
@@ -410,6 +432,11 @@ skipped.
   benchmark shape at `-U0/-U1/-U3/-U7` and `--byte-offsets`; the class
   numbering, the hash and the renumbering all change internal representations
   and none of them may change a byte of output.
+- **A match at differing offsets may not decide the verdict** (§16). It proves
+  content, not position. Keep `anchors_keep_same_offset()` where the answer for
+  two files of the same length is reached, and keep the gate that applies it —
+  the gate is what leaves the read-free answer for an insertion whose tail was
+  re-cloned, and applying it unconditionally would cost that.
 
 ## 12. Revert strategy
 
@@ -654,7 +681,9 @@ branches become unreachable. The gate on length is what keeps the read-free
 case working: where the lengths differ the verdict is free, so a shifted match
 costs nothing and still saves the reads that say *where* the difference is.
 Where they match, the addresses genuinely do not answer the question that was
-asked, and the region the crossed matches covered is read instead.
+asked, and what is read instead is everything the *surviving* same-offset
+matches do not already cover: the crossed region, the gaps either side of it,
+and the whole file when no same-offset match survives at all.
 
 The rejected alternative is worth recording so it is not retried: making the
 one-sided branch verify itself by comparing at the same offsets is unsound on
