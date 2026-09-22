@@ -165,6 +165,18 @@ int compare_files(const char *pa, const char *pb, bool in_recursion)
 	    open_map(pb, &mb, &fd_b, &sb) < 0)
 		goto out;
 
+	/*
+	 * --dump-extents asks for the map, not for a comparison, so it comes
+	 * before the shortcut below.  Naming the same file twice is a fair way
+	 * to ask for one map twice, and it used to print "identical" instead.
+	 */
+	if (opt_dump) {
+		dump_map(pa, &ma);
+		dump_map(pb, &mb);
+		rc = 0;
+		goto out;
+	}
+
 	/* The same inode twice needs no work and no reads. */
 	if (sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino) {
 		/* Neither -q nor -r says anything about files that match: -q
@@ -175,14 +187,9 @@ int compare_files(const char *pa, const char *pb, bool in_recursion)
 		if (!in_recursion && !opt_brief)
 			printf("Files %s and %s are identical\n", pa, pb);
 		rc = 0;
-		goto out;
-	}
-
-	if (opt_dump) {
-		dump_map(pa, &ma);
-		dump_map(pb, &mb);
-		rc = 0;
-		goto out;
+		/* Through stats, not past it: --stats describes what the
+		 * comparison read, and this one read nothing. */
+		goto stats;
 	}
 
 	/*

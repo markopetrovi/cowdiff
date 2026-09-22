@@ -357,6 +357,18 @@ else
 	fail=$((fail + 1)); echo "FAIL: --stats reports $over% of a file read"
 fi
 
+# And the pair that reads nothing at all, being one inode, still has to say so:
+# the shortcut that answers it used to leave --stats behind with it.
+rm -rf ST3; mkdir -p ST3
+head -c 100000 /dev/urandom > ST3/f
+ln ST3/f ST3/g
+line=$("$COW" --stats ST3/f ST3/g 2>&1 >/dev/null | grep '^cowdiff: read')
+if [ "$line" = "cowdiff: read 0 of 200000 bytes (0.0000%)" ]; then
+	pass=$((pass + 1))
+else
+	fail=$((fail + 1)); echo "FAIL: --stats for one inode said '$line'"
+fi
+
 # --- byte-offset mode -------------------------------------------------------
 # The bodies must match the line-number form exactly, and every hunk's offsets
 # must point at the content that hunk shows.

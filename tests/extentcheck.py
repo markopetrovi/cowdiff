@@ -228,6 +228,24 @@ def block_phys(path, blk):
     return out
 
 
+def case_dump_itself():
+    """--dump-extents asks for the map, not for a verdict.
+
+    Naming one file twice is a fair way to ask for its map twice; the
+    same-inode shortcut answered first and printed "are identical" instead.
+    """
+    name = "--dump-extents on one file twice"
+    a = fx("d_a.bin")
+    with open(a, "wb") as f:
+        f.write(os.urandom(2 * 4096))
+
+    rc, out, err = cow("--dump-extents", a, a)
+    text = out.decode(errors="replace")
+    check("%s: the map is printed" % name,
+          rc == 0 and text.count("extents,") == 2 and "identical" not in text,
+          text[:200] or err.decode(errors="replace")[:200])
+
+
 def case_compressed():
     """A compressed extent's fe_length is the length the data will have once
     decompressed, so [address, address+length) overstates the space it takes
@@ -595,7 +613,8 @@ def case_unwritten():
           got is not None and got <= (2 << 20) + (1 << 16), got)
 
 
-CASES = [case_compressed, case_shifted_share, case_crossed_share,
+CASES = [case_dump_itself, case_compressed, case_shifted_share,
+         case_crossed_share,
          case_shifted_equal_span, case_hole_punch, case_zeros_vs_hole,
          case_hole_then_data, case_hole_then_zeros, case_inline,
          case_unwritten]

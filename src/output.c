@@ -65,16 +65,13 @@ bool is_binary(int fd)
 
 /* ---- binary ----------------------------------------------------------- */
 
+/* Called with at least one delta: compare_files() answers "identical" itself,
+ * from an empty list, before it gets here. */
 int emit_binary_diff(const char *path_a, const char *path_b,
 		     const struct deltalist *dl)
 {
 	unsigned long long only_a = 0, only_b = 0, unread = 0;
 	size_t i, nunread = 0;
-
-	if (dl->n == 0) {
-		printf("Files %s and %s are identical\n", path_a, path_b);
-		return 0;
-	}
 
 	for (i = 0; i < dl->n; i++) {
 		only_a += dl->v[i].a_len;

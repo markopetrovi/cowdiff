@@ -122,18 +122,25 @@ static char *join(const char *dir, const char *name)
  */
 struct level {
 	const struct level *up;
+	bool have_a, have_b;	/* that side was identified */
 	dev_t dev_a, dev_b;
 	ino_t ino_a, ino_b;
 };
 
-/* Is either directory one we are already inside? */
+/* Is either directory one we are already inside?  A side that could not be
+ * identified is not compared: dev and ino of zero are real values on some
+ * filesystems, so "unknown" has to be tracked, not encoded. */
 static bool is_ancestor(const struct level *up, const struct stat *sa,
 			const struct stat *sb)
 {
-	for (; up; up = up->up)
-		if ((up->dev_a == sa->st_dev && up->ino_a == sa->st_ino) ||
-		    (up->dev_b == sb->st_dev && up->ino_b == sb->st_ino))
+	for (; up; up = up->up) {
+		if (up->have_a && up->dev_a == sa->st_dev &&
+		    up->ino_a == sa->st_ino)
 			return true;
+		if (up->have_b && up->dev_b == sb->st_dev &&
+		    up->ino_b == sb->st_ino)
+			return true;
+	}
 	return false;
 }
 
@@ -164,16 +171,27 @@ static void walk_dir(const char *pa, const char *pb, const struct level *up)
 	char **la = list_dir(pa, &na);
 	char **lb = list_dir(pb, &nb);
 
-	/* Both sides named, both exist: this level is now an ancestor of
-	 * whatever is walked below it. */
-	if (stat(pa, &sa) == 0 && stat(pb, &sb) == 0) {
-		here.up = up;
+	/*
+	 * Whatever is walked below this level is inside it, so this level
+	 * becomes an ancestor of it.  Each side is recorded on its own: a
+	 * stat() that fails takes that side's identity away and nothing else.
+	 * The walk only recurses into a pair whose two sides were both stat'd
+	 * by the time this is called, so the chain is complete on the path that
+	 * matters -- and a level dropped whole would be a hole in the loop
+	 * detection that nothing would notice until a symlink found it.
+	 */
+	here.up = up;
+	here.have_a = stat(pa, &sa) == 0;
+	here.have_b = stat(pb, &sb) == 0;
+	if (here.have_a) {
 		here.dev_a = sa.st_dev;
 		here.ino_a = sa.st_ino;
+	}
+	if (here.have_b) {
 		here.dev_b = sb.st_dev;
 		here.ino_b = sb.st_ino;
-		up = &here;
 	}
+	up = &here;
 
 	/*
 	 * A listing that failed leaves nothing to pair against.  list_dir() has
