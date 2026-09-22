@@ -483,16 +483,35 @@ static int resolve_gap(int fd_a, const struct extmap *ma,
 			return -1;
 		if (common_suffix(fd_a, ae, fd_b, be, limit - kp, &ks) < 0)
 			return -1;
-		/* Both empty means the spans are the same bytes at different
-		 * offsets, which is not "nothing changed here". */
-		if (alen - kp - ks || blen - kp - ks) {
-			if (deltas_push(out, as + kp, alen - kp - ks,
-					bs + kp, blen - kp - ks) < 0)
-				return -1;
+		/*
+		 * Both trimmed lengths zero means the two spans are the same
+		 * bytes at different offsets: the alignment moved, the content
+		 * did not.  Reporting that as a difference would name bytes
+		 * that were just found equal, and the shift is already reported
+		 * by the gap that opened it -- a chain only comes to sit at a
+		 * new offset because some gap changed the offset delta, and
+		 * that gap's two spans have different lengths, so its trimmed
+		 * lengths cannot both vanish and it always reports.
+		 *
+		 * Both zero is only reachable when the lengths are equal, since
+		 * kp + ks is capped by the shorter span, so the test is exact.
+		 */
+		if (alen - kp - ks == 0 && blen - kp - ks == 0)
 			return 0;
-		}
+		if (deltas_push(out, as + kp, alen - kp - ks,
+				bs + kp, blen - kp - ks) < 0)
+			return -1;
+		return 0;
 	}
 
+	/*
+	 * Reached with `stop` for any two-sided gap that is not at identical
+	 * offsets with equal lengths, including the one above: -q wants the
+	 * verdict, not the report, and finding the common ends costs a read of
+	 * everything up to the first difference.  A gap that has moved offsets
+	 * means some gap changed the delta, so the two files differ either way
+	 * and the push is right.
+	 */
 	if (deltas_push(out, as, alen, bs, blen) < 0)
 		return -1;
 	return stop ? 1 : 0;

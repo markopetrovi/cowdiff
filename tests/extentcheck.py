@@ -370,6 +370,65 @@ def case_crossed_share():
           "%s %s" % (rc, out.decode(errors="replace")))
 
 
+def case_shifted_equal_span():
+    """A gap between two shifted matches whose two sides hold equal bytes.
+
+    A chain that has moved offsets can leave an interior gap whose spans are
+    the same bytes at different offsets: the alignment shifted, the content did
+    not.  There is nothing to report there -- the shift is already reported by
+    the gap that opened it -- and reporting it anyway named a region as changed
+    whose two sides are byte-identical, in binary output where no line diff
+    follows to trim the claim back.
+
+    A = S1|M|S2 and B = PAD|S1|M|S2, with S1 and S2 cloned from A one block
+    further along.  The middle block has to be a copy that is *not* shared, or
+    it becomes an ordinary match at identical offsets and the gap it should
+    leave does not exist; writing it in place afterwards gives it an extent of
+    its own holding the same bytes.
+    """
+    name = "shifted span that is byte-identical"
+    a, b = fx("e_a.bin"), fx("e_b.bin")
+    blk = 4096
+    s1, m, s2, pad = (os.urandom(blk) for _ in range(4))
+
+    with open(a, "wb") as f:
+        f.write(s1 + m + s2)
+    with open(b, "wb") as f:
+        f.write(pad + s1 + m + s2)
+    with open(b, "r+b") as f:               # an unshared copy of the middle
+        f.seek(2 * blk)
+        f.write(m)
+
+    for src, dst in ((0, blk), (2 * blk, 3 * blk)):
+        r = subprocess.run([PROBE, "clone", a, b, str(src), str(blk), str(dst)],
+                           capture_output=True)
+        if r.returncode != 0:
+            raise Skip("FICLONERANGE unavailable: %s"
+                       % r.stderr.decode(errors="replace").strip())
+
+    pa, pb = block_phys(a, blk), block_phys(b, blk)
+    if pa is None or pb is None or len(pa) != 3 or len(pb) != 4 or \
+       pa[0] != pb[1] or pa[2] != pb[3] or pa[1] == pb[2]:
+        raise Skip("the filesystem did not lay the blocks out as the case "
+                   "needs: %s vs %s" % (pa, pb))
+
+    rc, out, err = cow("--force-binary", a, b)
+    regions = parse_regions(out)
+    check("%s: only the insertion is reported" % name,
+          regions == [(0, 0, 0, blk)], regions)
+    check("%s: exit status says different" % name, rc == 1, rc)
+
+    # The general form of the same property, so that a fixture which drifts
+    # into some other shape is still caught: a region with two sides may not
+    # claim a difference between bytes that are equal.
+    data_a, data_b = read(a), read(b)
+    liar = next((r for r in regions
+                 if r[1] and r[3]
+                 and data_a[r[0]:r[0] + r[1]] == data_b[r[2]:r[2] + r[3]]), None)
+    check("%s: no region claims a difference between equal bytes" % name,
+          liar is None, liar)
+
+
 def case_hole_punch():
     """Holes are skipped, but data against a hole still has to be examined,
     because a real extent can hold nothing but zeros."""
@@ -537,8 +596,9 @@ def case_unwritten():
 
 
 CASES = [case_compressed, case_shifted_share, case_crossed_share,
-         case_hole_punch, case_zeros_vs_hole, case_hole_then_data,
-         case_hole_then_zeros, case_inline, case_unwritten]
+         case_shifted_equal_span, case_hole_punch, case_zeros_vs_hole,
+         case_hole_then_data, case_hole_then_zeros, case_inline,
+         case_unwritten]
 
 
 def main():

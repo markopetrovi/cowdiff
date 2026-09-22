@@ -6,7 +6,7 @@ what happened the last time that was all there was: the worst bug the tool has
 had lived in a path no shape reached.  This builds pairs at random instead and
 checks the things that are true of every correct answer.
 
-Four oracles, in the order they matter:
+Five oracles, in the order they matter:
 
   * **The invariant (§2).**  `-q` returning 0 must mean the bytes really are
     equal.  A false "identical" is silent — exit 0, no output, and whatever
@@ -16,6 +16,11 @@ Four oracles, in the order they matter:
     unified diff; this is that claim, tested without needing GNU diff to agree
     (more than one diff can be correct, and this one is allowed to differ).
   * **The exit status must agree with diff(1)** — 0, 1 or 2 for the same pair.
+  * **A reported region must not call equal bytes different**: the other
+    direction from the first oracle, and the one that is easy to lose when the
+    alignment moves.  Regions that could not be read are exempt -- they claim
+    nothing about content -- as are pure insertions and deletions, which have
+    no second side to compare.
   * **Binary mode must not omit a difference**: every run of differing bytes
     must sit inside a reported region, on both sides, and the regions must not
     overlap or run past the end of a file.  Only shapes the tool compares at
@@ -190,6 +195,29 @@ def regions_from(out):
     return regions
 
 
+def lying_region(da, db, out):
+    """The first region that reports a difference between bytes that are equal.
+
+    Only the two-sided form of a region can lie this way -- a pure insertion or
+    deletion has no other side to compare with, and a region that could not be
+    read claims nothing about content, only that nothing was established.  The
+    property is sound for every answer: a run of differing bytes starts at a
+    byte that was just found to differ.
+    """
+    for line in out.split(b"\n"):
+        if b"unreadable" in line or b"->" not in line:
+            continue
+        nums = NUM.findall(line)
+        if len(nums) < 2:
+            continue
+        (ao, al), (bo, bl) = nums[0], nums[1]
+        ao, al = int(ao, 16), int(al)
+        bo, bl = int(bo, 16), int(bl)
+        if al and bl and da[ao:ao + al] == db[bo:bo + bl]:
+            return (ao, al, bo, bl)
+    return None
+
+
 def differing_runs(a, b):
     """Maximal runs of differing bytes at the same offsets."""
     n = min(len(a), len(b))
@@ -351,7 +379,16 @@ def run_case(cow, rng, tag, args):
                 f.write(p.stdout)
             return False
 
-    # 4. binary mode reports every difference, once
+    # 4. no region may claim a difference between bytes that are equal
+    p = subprocess.run([cow, "--force-binary", pa, pb], capture_output=True)
+    liar = lying_region(da, db, p.stdout)
+    if liar:
+        complain(name + ": a region calls equal bytes different",
+                 "region (a %d +%d, b %d +%d)" % liar)
+        keep(tag, pa, pb)
+        return False
+
+    # 5. binary mode reports every difference, once
     if same_offsets:
         p = subprocess.run([cow, "--force-binary", pa, pb],
                            capture_output=True)
