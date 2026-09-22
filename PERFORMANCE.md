@@ -130,6 +130,7 @@ identical files cost the same as they always did, and twice as fast as
 Already done, newest first:
 
     f8e232a  Report what a shifted span shares, not the whole span
+    019907e  Carry on when a block cannot be read
     3d2de4c  Update the limits section for where the tool now stands
     4754824  Count newlines eight bytes at a time
     7e186aa  Benchmark the binary and -q paths
@@ -379,6 +380,39 @@ skipped.
 Each optimisation is its own commit and they are independent, so a failed
 attempt is `git revert <commit>`, or a reset to the commit before it. Nothing
 has ever been pushed; this is a local repository only.
+
+## 14. Unreadable storage (019907e)
+
+An EIO used to abort the run: no output at all, exit 2, everything already
+established thrown away.  It came from a real pair of disk images with a list
+of 11016 blocks that read as EIO on the host that imaged them.
+
+The rule now is this tool's own rule, applied one level down.  A block that
+cannot be read cannot be *proven* equal, and anything unproven is a
+difference -- but it is not a block that was seen to differ, so the output
+says which kind it is, per region, and which side failed.  Four things are
+worth knowing:
+
+- **Blocks both files point at are still never read.**  Damage underneath a
+  shared extent costs nothing and those bytes stay proven equal.  On the real
+  pair, 63 of the 11016 listed blocks sit in storage both files share and are
+  simply equal.
+- **The retry is a block at a time.**  A failed chunk read is redone in 4 KB
+  units, so one bad block costs one block of report rather than a megabyte,
+  and its neighbours are still compared rather than assumed.
+- **Text output is coarser where it has to be.**  A line diff cannot span a
+  gap whose contents are unknown, so a delta with a bad block inside it is
+  reported as a byte range, and a newline count that crosses one gives up
+  line numbers for byte offsets.  Both say so where they happen.  Neither
+  fabricates content to fill the gap, which is the one thing that would break
+  §2: two unreadable blocks are not equal bytes, they are two unknowns.
+- **pread_full now separates EIO from a caller bug.**  A short read means the
+  range asked for ran past the end, which is a mistake in this program; EIO
+  means the storage underneath is damaged.  They were the same -1, which is
+  why this could not be handled where it happens.
+
+`COWDIFF_EIO_AT="offset:length"` makes reads fail on demand, which is how the
+suite tests this without a damaged disk; nothing else sets it.
 
 ## 13. Not done
 

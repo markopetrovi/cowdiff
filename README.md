@@ -67,6 +67,10 @@ passing quietly.
 numbers — it repeats each command and, when comparing two binaries, pairs them,
 because a single run on a laptop varies by more than 2x.
 
+`COWDIFF_EIO_AT="offset:length"` makes every read of that range fail with
+`EIO`. It exists so the unreadable-block paths can be tested without a damaged
+disk, and nothing outside `tests/run.sh` sets it.
+
 **[`PERFORMANCE.md`](PERFORMANCE.md)** is the working notebook behind the
 numbers above: what each optimisation measured, and the wrong predictions that
 had to be measured to be corrected. Six of them so far. It also records the two
@@ -164,6 +168,17 @@ rewrite the tail; either way btrfs allocates fresh extents and there is nothing
 to skip. The headline win is snapshots and reflink copies, not edited files.
 An insertion with a re-shared tail is reported without reading the tail, but
 reaching that state takes an explicit `FICLONERANGE`.
+
+**Storage that cannot be read is reported, not skipped.** A block that returns
+EIO cannot be shown to hold equal bytes, so it is reported as a difference —
+and said to be a different *kind* of finding, because nothing was seen to
+differ there. Where the two files point at the same physical extent the block
+is never read at all, so damage underneath it costs nothing and the bytes are
+still proven equal. Two places are coarser than they would otherwise be: a
+delta that cannot be line-diffed because a block inside it is unreadable is
+reported as a byte range rather than as lines, and line numbers are given up
+for byte offsets when a newline count crosses an unreadable block. Both are
+coarser, neither is wrong, and both say so where they happen.
 
 **Two filesystems are not comparable.** Equal addresses from separate
 filesystems are a coincidence. Files are checked with `st_dev` first, then
