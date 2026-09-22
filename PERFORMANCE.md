@@ -106,8 +106,8 @@ Run before and after every change:
   named twice. Fixtures that cannot be built on the filesystem in use **skip
   loudly** rather than passing quietly — a test that silently stops testing its
   named path is worse than no test. Two of them skip on a layout rather than a
-  filesystem, because this btrfs will share identical blocks by itself and will
-  not always do it (§16).
+  filesystem, because whether a block ends up shared depends on how the file was
+  written rather than on what it contains (§6).
 - `tests/fuzz.py` builds pairs at random and checks what is true of every
   correct answer rather than comparing against a shape: §2's invariant on
   every case, the patch oracle, the exit status against `diff`, that no
@@ -275,13 +275,17 @@ that match nothing in the other file before searching, and `too_expensive`
   deliberately does not: it is run routinely between builds, and rebuilding the
   fixtures is a twelve-second detour (519 MB, 11.9s here).
 - **A fixture has to check the layout it got, not the layout it asked for.**
-  This filesystem (`compress=zstd:1`) shares identical blocks between files by
-  itself, and does not always do it: blocks written in one call are shared with
-  each other, two calls usually are not, and rewriting a block in place is the
-  only reliable way to get an extent of its own holding the same bytes.  A case
-  that needs a crossed or an unshared arrangement must read the extents back and
-  *skip loudly* if it got something else, which `case_crossed_share` and
-  `case_shifted_equal_span` do (§16).
+  Nothing about the *content* makes this filesystem share extents; how the bytes
+  were written decides.  Coreutils 9 copies through `copy_file_range()` wherever
+  it can — plain `cp`, and `cat` when its output is a regular file, which is not
+  obvious — and btrfs implements that as a reflink, so those writes land on the
+  source's blocks: `shared`, and zero exclusive bytes in `btrfs filesystem du`.
+  A write through the page cache (`dd`, python's `write()`,
+  `cp --reflink=never`) allocates its own extents instead, identical content or
+  not.  So a case that needs a crossed or an unshared arrangement must read the
+  extents back and *skip loudly* if it got something else, which
+  `case_crossed_share` and `case_shifted_equal_span` do (§16).  To make a share,
+  say so: `tests/probe clone` performs `FICLONERANGE`.
 - **`/tmp` is tmpfs here.**  `FICLONERANGE` returns ENOTSUP there and FIEMAP
   reports one untrusted extent, so a fixture built outside the repo runs down
   the unshared path and tests nothing it names.  Build them under the repo —
