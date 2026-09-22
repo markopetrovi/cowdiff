@@ -1,5 +1,5 @@
 CC      ?= cc
-CFLAGS  ?= -O2 -Wall -Wextra -std=gnu11
+CFLAGS  ?= -O3 -Wall -Wextra -std=gnu11 -march=native -mtune=native
 PREFIX  ?= /usr/local
 
 SRC = src/main.c src/extmap.c src/anchor.c src/delta.c src/linediff.c \
