@@ -1,9 +1,10 @@
 # Handoff notes
 
 Everything worth knowing before picking this up again. Started at the end of
-the session that built the tool, and updated at the end of the session that
-worked through both performance targets. Read in full before changing
-anything.
+the session that built the tool, updated at the end of the session that worked
+through both performance targets, and updated again after the audit that found
+§16 — which is where the claim this whole design rests on turned out to be one
+word too strong. Read in full before changing anything.
 
 Despite the filename this is not only about performance — it covers what the
 tool is, the one correctness invariant that must survive any change, how to
@@ -72,26 +73,35 @@ Nothing here is about test files. It is the property the tool is built around.
 Run before and after every change:
 
     make check                                            # both lines below
-    ./tests/run.sh                                        # 76 checks
-    python3 tests/extentcheck.py ./cowdiff ./tests/probe  # 22 checks
+    ./tests/run.sh                                        # 80 checks
+    python3 tests/extentcheck.py ./cowdiff ./tests/probe  # 32 checks
 
 - `tests/run.sh` compares text output against GNU diff byte for byte across
   22 edit shapes (including files whose last line has no newline), checks
   `-U0/1/2/3/7` context against `diff -U` on three of them, checks `-r`
   against `diff -ru`, checks that `-q` is as silent as `diff -q` is, that the
   options diff accepts — including bunched ones like `-rq` — are accepted
-  here, that a symlink loop is reported once instead of followed, and that
-  `--stats` describes one file rather than the run. It runs
+  here, that a symlink loop is reported once instead of followed, that a
+  directory which cannot be listed is reported as a failure rather than as
+  empty on this side, that `-r` says nothing about a pair that shares an inode,
+  and that `--stats` describes one file rather than the run (including the one
+  pair that reads nothing at all). It runs
   `tests/bytecheck.py` for `--byte-offsets` and `tests/deltacheck.py` for the
   coarse fallback. Two further checks cover files with no unique lines, where
   more than one answer is correct and the property tested is instead that the
   diff applied to A rebuilds B (§9).
 - `tests/extentcheck.py` covers the paths where the extent map rather than the
   byte comparison decides the answer: compressed extents, a shifted share
-  built with `FICLONERANGE`, punched holes, zeros against a hole, a hole
-  followed by data, inline extents, unwritten extents. Fixtures that cannot be
-  built on the filesystem in use **skip loudly** rather than passing quietly —
-  a test that silently stops testing its named path is worse than no test.
+  built with `FICLONERANGE`, a *crossed* share — the same blocks cloned into
+  the two files in the other order, which is what let a shifted chain decide a
+  verdict (§16) — a gap between two shifted matches whose spans are
+  byte-identical, punched holes, zeros against a hole, a hole followed by
+  data, inline extents, unwritten extents, and `--dump-extents` on one file
+  named twice. Fixtures that cannot be built on the filesystem in use **skip
+  loudly** rather than passing quietly — a test that silently stops testing its
+  named path is worse than no test. Two of them skip on a layout rather than a
+  filesystem, because this btrfs will share identical blocks by itself and will
+  not always do it (§16).
 - `tests/fuzz.py` builds pairs at random and checks what is true of every
   correct answer rather than comparing against a shape: §2's invariant on
   every case, the patch oracle, the exit status against `diff`, and binary
@@ -432,6 +442,11 @@ has ever been pushed; this is a local repository only.
   whole file is one delta. Beating `diff` there means a bounded Myers-style
   search, or `discard_confusing_lines()`-style filtering, and neither is a
   small change.
+- For a pair of *different* lengths, a gap with one side empty is still written
+  down as an insertion or deletion without either side being read. The verdict
+  is right there — the length settles it — but the region is a statement about
+  where the bytes went, derived from an alignment that is not unique, and §16
+  is what happens when the same statement is allowed to decide the verdict.
 
 ## 14. Unreadable storage (019907e)
 
@@ -448,7 +463,9 @@ worth knowing:
 - **Blocks both files point at are still never read.**  Damage underneath a
   shared extent costs nothing and those bytes stay proven equal.  On the real
   pair, 63 of the 11016 listed blocks sit in storage both files share and are
-  simply equal.
+  simply equal.  One exception, added in §16: a share at a *different* offset
+  in the two files is compared rather than trusted when the lengths match, so
+  damage there is reported like any other unreadable region.
 - **The retry is a block at a time.**  A failed chunk read is redone in 4 KB
   units, so one bad block costs one block of report rather than a megabyte,
   and its neighbours are still compared rather than assumed.
@@ -595,4 +612,124 @@ shapes), and neither gets a wrong answer to save time.
 One thing deliberately left alone: `-r` still has no `--` (end of options), so
 a file whose name begins with `-` cannot be named. It is the only remaining
 case where an argument diff accepts is refused, and it is a small addition if
-anyone needs it.
+anyone needs it. (A second divergence turned up while testing §16: `diff -ru
+FILE DIR` goes looking for `DIR/FILE` and compares that pair, where this refuses
+the invocation. The refusal is deliberate — it is not a comparison this tool has
+an answer for — and the message says why.)
+
+## 16. The chain decides the gaps; it must not decide the verdict
+
+The whole design rests on a claim that was written down in `README.md` and in
+`anchor.c`'s header comment, and the claim was one word too strong:
+
+> Any such chain is a correct alignment, so the selection can be greedy: a
+> worse choice only means larger gaps to compare, never a wrong answer.
+
+True of gaps that get **compared**. False for the gaps that resolve *without
+reading anything*, and those are exactly the gaps a shifted chain leaves:
+`resolve_gap()` reports a one-sided gap as an insertion or deletion outright,
+on the alignment's word alone. So a chain at a shifted alignment is not merely
+coarser than the best one, it is wrong — and one is easy to build:
+
+    A := R||R, written in two calls so the two blocks are separate extents
+    B := clone A[4096..8192) into B[0];  clone A[0..4096) into B[4096]
+    cmp A B        -> identical
+    cowdiff -q A B -> "Files A and B differ", exit 1, having read 0 bytes
+
+The intersection can pair A's first block with B's *second* and the other way
+round, so every chain on offer is shifted and both gaps it leaves are
+one-sided. Randomised crossed layouts got it wrong in 153 of 250 cases; a
+text-file variant printed a 395-line diff for two identical files. It fails in
+the direction §2 permits, which is why the invariant held and the audit did not
+look there — but a wrong exit status is a wrong answer, and this one was
+produced by *not looking*, which is the one thing §5 says never to do.
+
+**The fix is at the top, not in the gap.** `anchors_keep_same_offset()` drops
+every match whose two ranges sit at different file offsets, and is called when
+the two files are the same length. With only same-offset matches left, every
+gap is at matching offsets on both sides — by induction from offset 0, since
+the anchors keep `prev_a == prev_b` — so every gap reaches
+`gap_equal_range()`/`compare_range()` and is compared, and the one-sided
+branches become unreachable. The gate on length is what keeps the read-free
+case working: where the lengths differ the verdict is free, so a shifted match
+costs nothing and still saves the reads that say *where* the difference is.
+Where they match, the addresses genuinely do not answer the question that was
+asked, and the region the crossed matches covered is read instead.
+
+The rejected alternative is worth recording so it is not retried: making the
+one-sided branch verify itself by comparing at the same offsets is unsound on
+its own. `A = Q||R||Q` against `B = Q||Q||R`, with A's first 8192 bytes shared
+with B's last 8192, has both gaps compare equal — and the two files differ.
+
+**The same mistake had a second half.** `resolve_gap()` trims each gap to the
+part that differs; when the trims consume both spans, the spans are
+byte-identical at different offsets, and the code reported the whole span as a
+difference anyway ("the spans are the same bytes at different offsets, which is
+not 'nothing changed here'"). The verdict was right — the files differed
+elsewhere — but the region named bytes just found equal:
+
+    changed   A[0x1000, 4096 bytes] -> B[0x2000, 4096 bytes]
+
+Text output never showed it, because `span_trim()` trims that delta away again
+before the line diff sees it, which is why it is a binary-mode finding. The
+shift is not lost by dropping it: it is reported by the gap that opened it, and
+that gap's two spans have different lengths, so its trimmed lengths cannot both
+vanish and it always reports.
+
+**The near-miss.** That statement is reached by two paths: the `!stop`
+fall-through, where both trimmed lengths are zero (only possible when the spans
+are the same length), and — with `-q` — any two-sided gap that is not at
+identical offsets with equal lengths, including an unshared pair of different
+sizes, where that single delta *is* the whole verdict. Making the push itself
+conditional would have had `-q` answer "identical" for most differing pairs.
+The change is confined to the non-`stop` path and the comment on the push now
+says why it is right for `stop`.
+
+**Nothing in §4 changed.** Those shapes are either unshared, or a reflink
+edited in place or a snapshot, which are all matches at identical offsets, so
+no benchmark shape reaches either change. What changed is one layout that used
+to answer in 0.00s without reading and now reads: same length, shares crossed.
+On damaged media that answer is "difference" rather than "identical", and it
+has to be — with crossed shares, equality at the same offsets was never
+provable from the addresses, so there is no read-free "identical" to be had
+there. README's promise that a shared block is never read needed "at the same
+offset" adding to it, in the limits section and in §14 above.
+
+**Fixtures, since they will be written again.** This filesystem
+(`compress=zstd:1`) shares identical blocks between files on its own, and does
+not always do it, so a fixture that needs a crossed or an unshared layout has
+to check the layout it got and skip loudly if it is something else —
+`case_crossed_share` and `case_shifted_equal_span` both do. Blocks written in
+one call are shared with each other; two calls are not; and rewriting a block
+in place gives it an extent of its own holding the same bytes, which is the only
+reliable way to get an unshared copy. And `/tmp` is tmpfs: `FICLONERANGE` is
+ENOTSUP there, so a fixture built outside the repo silently tests the unshared
+path instead of the one it names.
+
+New tests, each run against the binary from before its fix: `crossed share
+(FICLONERANGE at a different offset)` and `shifted span that is byte-identical`
+in `tests/extentcheck.py` — 3 and 2 of their checks fail against the old binary
+— a `share` mode in `tests/fuzz.py` that builds crossed pairs at random, which
+fails on the status oracle against the old binary, and an oracle that no
+reported region may call equal bytes different.
+
+Five smaller things went in with this. Four are checked, each against the
+binary from before its change: `-r` printed "are identical" for a pair that
+shares an inode, where `diff -ru` says nothing about a pair that matches; `-r`
+reported the other side's names as "Only in" when a listing had failed, which
+is a claim about a directory nothing was read from; `--dump-extents f f`
+printed a verdict instead of the map; and `--stats` was skipped for the
+same-inode pair, the one pair that reads nothing at all.
+
+The fifth has no test and is not expected to be reachable, and it is written
+down here so that nobody has to wonder why: `walk_dir()` dropped a level out of
+the ancestry chain it uses for symlink-loop detection when either `stat()`
+failed, leaving a hole that only a loop through that level would ever notice.
+Each side is now recorded on its own, which changes nothing observable — the
+walk only recurses into a pair whose two sides the caller has already stat'd —
+and is there for the same reason §15.1's `range_is_zero` fix is: the mistake is
+latent, the failure it would produce is silent, and a second caller is one
+function signature away. Kept, against the alternative of reverting it for
+being dead code, because it replaces a conditional rather than adding one and
+because "unknown" is a flag now instead of a value that dev and ino of zero
+could be confused with.
