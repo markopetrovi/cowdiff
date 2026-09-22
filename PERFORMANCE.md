@@ -129,24 +129,30 @@ identical files cost the same as they always did, and twice as fast as
 
 Already done, newest first:
 
-    f8e232a  Report what a shifted span shares, not the whole span
+    e5723a9  Document what happens when a block cannot be read
     019907e  Carry on when a block cannot be read
+    a8a4502  Add a license, and point at the notes from the README
+    703cc7b  Correct what the benchmark says diff does with binary files
+    0e406b5  Correct the check count in the gate
+    8d3754f  Document that the binary path no longer reports whole spans
+    f8e232a  Report what a shifted span shares, not the whole span
+    23f0a3e  Fix a stale figure cross-referenced from §8
+    7c72730  Bring the handoff notes up to date
     3d2de4c  Update the limits section for where the tool now stands
     4754824  Count newlines eight bytes at a time
     7e186aa  Benchmark the binary and -q paths
     e10f74f  Write the file's timestamp in the ---/+++ header, as diff does
     29a926b  Note the -q shortcut in the handoff notes
     0d4e5c9  Let -q stop at the first difference it proves
+    95e4f22  Record the delta trim, and fix the notes' numbering
     0685481  Trim a delta to the part that differs before diffing it
+    39b081e  Update the handoff notes for where things now stand
     e11d53a  Add a benchmark harness that can see a few percent
     cb309b5  Let the newline counts vectorise
     2250ed0  Hash lines a word at a time, and print through a buffer
     885a2b8  Split at the middle when nothing is unique, instead of giving up
     720950b  Assign line classes by sorting, not by hashing
     db11c4b  Compare line classes, not line text
-    0ee236b  Skip the line diff when the alignment is already known
-    fb1f6d2  Measure before optimising, then fix what the measurement found
-    9175049  Add -r, and give the extent checks an oracle independent of cowdiff
 
 ## 5. Method — read this before touching performance
 
@@ -381,6 +387,30 @@ Each optimisation is its own commit and they are independent, so a failed
 attempt is `git revert <commit>`, or a reset to the commit before it. Nothing
 has ever been pushed; this is a local repository only.
 
+## 13. Not done
+
+- There is no randomized testing. The 47 checks in `tests/run.sh` are
+  hand-built shapes, and §9's bug — the worst one found so far — lived in a
+  fallback path that no hand-built shape exercised. A differential fuzz
+  against GNU diff, using "applying the output to A rebuilds B" as the
+  oracle rather than a byte-for-byte match, is the obvious next thing to
+  build.
+- The `GROUP_MAX` cap in `classes_assign` has never run. Reaching it needs 64
+  distinct lines sharing one 32-bit fingerprint, which is not reachable by
+  accident and would take a crafted file.
+- Files with more than 2^31 lines would truncate a line index; `struct lref`
+  and `struct cent` before it both store it in 32 bits.
+- On the reflinked shape the newline count is the runtime (0.019s of it),
+  at about 1.8x what `wc -l` spends on the same job and the same bytes. The
+  loop is now eight bytes at a time (§4, 4754824); what is left is the read
+  underneath it, which 64 KB chunks against `wc`'s larger ones may not be
+  describing well. A 1 MB buffer was tried and measured at 1.6%, so the
+  difference is somewhere else — worth a `perf` run rather than a guess.
+- The two shapes in §4 that this tool still loses are the ones where the
+  whole file is one delta. Beating `diff` there means a bounded Myers-style
+  search, or `discard_confusing_lines()`-style filtering, and neither is a
+  small change.
+
 ## 14. Unreadable storage (019907e)
 
 An EIO used to abort the run: no output at all, exit 2, everything already
@@ -413,27 +443,3 @@ worth knowing:
 
 `COWDIFF_EIO_AT="offset:length"` makes reads fail on demand, which is how the
 suite tests this without a damaged disk; nothing else sets it.
-
-## 13. Not done
-
-- There is no randomized testing. The 47 checks in `tests/run.sh` are
-  hand-built shapes, and §9's bug — the worst one found so far — lived in a
-  fallback path that no hand-built shape exercised. A differential fuzz
-  against GNU diff, using "applying the output to A rebuilds B" as the
-  oracle rather than a byte-for-byte match, is the obvious next thing to
-  build.
-- The `GROUP_MAX` cap in `classes_assign` has never run. Reaching it needs 64
-  distinct lines sharing one 32-bit fingerprint, which is not reachable by
-  accident and would take a crafted file.
-- Files with more than 2^31 lines would truncate a line index; `struct lref`
-  and `struct cent` before it both store it in 32 bits.
-- On the reflinked shape the newline count is the runtime (0.019s of it),
-  at about 1.8x what `wc -l` spends on the same job and the same bytes. The
-  loop is now eight bytes at a time (§4, 4754824); what is left is the read
-  underneath it, which 64 KB chunks against `wc`'s larger ones may not be
-  describing well. A 1 MB buffer was tried and measured at 1.6%, so the
-  difference is somewhere else — worth a `perf` run rather than a guess.
-- The two shapes in §4 that this tool still loses are the ones where the
-  whole file is one delta. Beating `diff` there means a bounded Myers-style
-  search, or `discard_confusing_lines()`-style filtering, and neither is a
-  small change.
