@@ -9,7 +9,10 @@ the content stored there. Bytes whose address is shared by both files are
 equal and never need to be read. Only what remains gets read and compared.
 
 On a pair of reflinked 4 MB files with a 4 KB insertion, this reads 4 KB where
-`diff` reads 8 MB.
+`diff` reads 8 MB. On a 10 GB reflinked pair with one 4 KB extent changed
+halfway in, it reads 8 KB and answers in under a millisecond, where `cmp` and
+`diff` must read 10 GB — from the start of both files to the difference — and
+take about twenty seconds doing it.
 
 ## How it works
 
@@ -45,7 +48,7 @@ On a pair of reflinked 4 MB files with a 4 KB insertion, this reads 4 KB where
 ## Building and testing
 
     make            # builds ./cowdiff and tests/probe
-    make check      # compares text output against GNU diff across 22 cases
+    make check      # 47 checks, most of them against GNU diff's own output
 
 `tests/probe` is a fixture helper doing exactly one thing:
 `probe clone SRC DST SRCOFF LEN DSTOFF`, which performs `FICLONERANGE`. It
@@ -59,6 +62,17 @@ byte comparison decides the answer: compressed extents, shifted shares,
 punched holes, zeros against a hole, inline extents, unwritten extents.
 Fixtures that cannot be built on the filesystem in use skip loudly rather than
 passing quietly.
+
+`tests/bench.sh` times a shape-by-shape overview and `tests/measure.py` is for
+numbers — it repeats each command and, when comparing two binaries, pairs them,
+because a single run on a laptop varies by more than 2x.
+
+**[`PERFORMANCE.md`](PERFORMANCE.md)** is the working notebook behind the
+numbers above: what each optimisation measured, and the wrong predictions that
+had to be measured to be corrected. Six of them so far. It also records the two
+bugs that were not slow but useless — a diff that claimed a million lines
+changed for a one-line edit, and a binary report that named the whole file —
+since "true" is not the same as "worth printing".
 
 ## Usage
 
@@ -157,3 +171,7 @@ filesystems are a coincidence. Files are checked with `st_dev` first, then
 `s_uuid_len`, so the generic ioctl returns `ENOTTY` for it and the btrfs one is
 needed. If the question cannot be answered the answer is no, which costs only
 the address optimisation.
+
+## License
+
+GNU General Public License, version 2 — see [`LICENSE`](LICENSE).
