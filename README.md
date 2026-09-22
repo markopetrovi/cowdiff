@@ -48,7 +48,7 @@ take about twenty seconds doing it.
 ## Building and testing
 
     make            # builds ./cowdiff and tests/probe
-    make check      # 47 checks, most of them against GNU diff's own output
+    make check      # tests/run.sh, then tests/extentcheck.py
 
 `tests/probe` is a fixture helper doing exactly one thing:
 `probe clone SRC DST SRCOFF LEN DSTOFF`, which performs `FICLONERANGE`. It
@@ -59,9 +59,15 @@ and then re-clone the tail from the original.
 
 `tests/extentcheck.py` covers the paths where the extent map rather than the
 byte comparison decides the answer: compressed extents, shifted shares,
-punched holes, zeros against a hole, inline extents, unwritten extents.
-Fixtures that cannot be built on the filesystem in use skip loudly rather than
-passing quietly.
+punched holes, zeros against a hole, a hole followed by data, inline extents,
+unwritten extents. Fixtures that cannot be built on the filesystem in use skip
+loudly rather than passing quietly.
+
+`tests/deltacheck.py` covers what happens once the list of differing regions
+fills up, which takes a pair of files tens of megabytes long: past a cap the
+rest of the file is reported as one coarse substitution, and what it checks is
+that the regions do not overlap, that none runs past the end of a file, and
+that no byte that differs is left out of them.
 
 `tests/bench.sh` times a shape-by-shape overview and `tests/measure.py` is for
 numbers — it repeats each command and, when comparing two binaries, pairs them,

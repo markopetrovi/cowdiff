@@ -328,24 +328,37 @@ static int rewind_lines(int fd, uint64_t off, unsigned int n, uint64_t *out,
 	return 0;
 }
 
-/* Step forward n lines, reporting how many were actually available. */
+/*
+ * Step forward n lines, reporting how many *newlines* the walk crossed.
+ *
+ * That is not the number of lines it entered.  The last line of a file need
+ * not end in a newline, so a walk that stops there has entered a line without
+ * crossing one -- and callers count lines as newline counts, which is why the
+ * difference matters: `crossed` is added to the newline count taken before
+ * the walk, and the caller then adds one more for a final unterminated line.
+ * Counting the step as well added that correction twice, and a hunk header
+ * claiming one line more than its body carries is a hunk patch(1) refuses.
+ */
 static int forward_lines(int fd, uint64_t off, uint64_t limit, unsigned int n,
-			 uint64_t *out, unsigned int *moved)
+			 uint64_t *out, unsigned int *crossed)
 {
-	unsigned int k = 0;
+	unsigned int k = 0, nl = 0;
 
 	while (k < n && off < limit) {
 		uint64_t e;
+		bool found;
 
-		if (line_end(fd, off, limit, &e) < 0)
+		if (line_end(fd, off, limit, &e, &found) < 0)
 			return -1;
 		if (e <= off)
 			break;
 		off = e;
 		k++;
+		if (found)
+			nl++;
 	}
 	*out = off;
-	*moved = k;
+	*crossed = nl;
 	return 0;
 }
 
@@ -522,11 +535,12 @@ static int emit_hunk(int fd_a, int fd_b, uint64_t size_a,
 	const struct bedit *e1 = &bl->v[last];
 	uint64_t a_lo, a_hi, b_lo, b_hi;
 	uint64_t old_start, old_count, new_start, new_count;
-	unsigned int back = 0, fwd = 0;
+	unsigned int back = 0, fwd_nl = 0;
 
 	if (rewind_lines(fd_a, e0->a_off, context_lines, &a_lo, &back) < 0)
 		return -1;
-	if (forward_lines(fd_a, e1->a_end, size_a, context_lines, &a_hi, &fwd) < 0)
+	if (forward_lines(fd_a, e1->a_end, size_a, context_lines, &a_hi,
+			  &fwd_nl) < 0)
 		return -1;
 
 	/*
@@ -539,12 +553,15 @@ static int emit_hunk(int fd_a, int fd_b, uint64_t size_a,
 
 	/*
 	 * Line numbers are newline counts, but a final line with no newline
-	 * is still a line, and diff(1) counts it as one.
+	 * is still a line, and diff(1) counts it as one.  `fwd_nl` counts
+	 * newlines crossed, not lines stepped onto, so that the correction
+	 * below is added exactly once whether or not the trailing context
+	 * reaches the unterminated end of the file.
 	 */
 	old_start = e0->a_line - back;
-	old_count = e1->a_end_line + fwd - old_start;
+	old_count = e1->a_end_line + fwd_nl - old_start;
 	new_start = e0->b_line - back;
-	new_count = e1->b_end_line + fwd - new_start;
+	new_count = e1->b_end_line + fwd_nl - new_start;
 	if (a_hi > a_lo && !ends_with_newline(fd_a, a_hi))
 		old_count++;
 	if (b_hi > b_lo && !ends_with_newline(fd_b, b_hi))
@@ -585,13 +602,15 @@ static int emit_hunk_bytes(int fd_a, int fd_b, uint64_t size_a,
 	const struct bedit *e0 = &bl->v[first];
 	const struct bedit *e1 = &bl->v[last];
 	uint64_t a_lo, a_hi, b_lo, b_hi;
-	unsigned int back = 0, fwd = 0;
+	unsigned int back = 0, fwd_nl = 0;
 
 	if (rewind_lines(fd_a, e0->a_off, context_lines, &a_lo, &back) < 0)
 		return -1;
-	if (forward_lines(fd_a, e1->a_end, size_a, context_lines, &a_hi, &fwd) < 0)
+	if (forward_lines(fd_a, e1->a_end, size_a, context_lines, &a_hi,
+			  &fwd_nl) < 0)
 		return -1;
 
+	/* Only the byte offsets are printed here, so neither count is used. */
 	b_lo = e0->b_off - (e0->a_off - a_lo);
 	b_hi = e1->b_end + (a_hi - e1->a_end);
 
@@ -638,13 +657,96 @@ static bool gap_is_close(int fd, uint64_t from, uint64_t to)
 }
 
 /*
+ * The one line boundary most recently asked about in a file.
+ *
+ * Every delta asks where the lines its two byte ranges fall on start and end,
+ * and each of those questions reads out to the nearest newline on its own.
+ * Almost always that is a few bytes, and the answer is the same one over and
+ * over when several edits land on the same line -- but a file whose lines are
+ * megabytes long, or which has no newlines in it at all (one long line is a
+ * shape that exists: minified JSON, a file with CR-only line endings), makes
+ * each question a walk over the rest of the file, and asking it per delta
+ * makes the run quadratic in what it reads instead of linear in the file.
+ *
+ * So the last line found is kept: a question about an offset on it is free,
+ * and a question about an offset elsewhere is asked the ordinary way and
+ * seeds the cache with *its* line.  That way an edit-dense file stops paying
+ * for its line lengths, an edit-sparse one pays exactly what it did before,
+ * and neither gets a wrong answer to save time.
+ */
+struct lcache {
+	int fd;
+	uint64_t size;
+	uint64_t line;		/* start of the line we know */
+	uint64_t end;		/* end of it: past its newline, or the size */
+	bool terminated;	/* that end is a newline, not the end of file */
+	bool valid;
+};
+
+/*
+ * The line containing `off`: where it starts, and where it ends.  Exactly what
+ * line_start() and line_end() answer between them.
+ */
+static int lcache_at(struct lcache *c, uint64_t off, uint64_t *start,
+		     uint64_t *end)
+{
+	/*
+	 * On the line we know.  A line that ends at the end of the file holds
+	 * that position as well; a line that ends in a newline does not, since
+	 * the position after it is the start of the next line.
+	 */
+	if (c->valid && off >= c->line &&
+	    (off < c->end || (off == c->end && !c->terminated))) {
+		*start = c->line;
+		*end = c->end;
+		return 0;
+	}
+
+	{
+		uint64_t s, e;
+		bool nl;
+
+		if (line_start(c->fd, off, &s) < 0)
+			return -1;
+		if (line_end(c->fd, off, c->size, &e, &nl) < 0)
+			return -1;
+
+		c->line = s;
+		c->end = e;
+		c->terminated = nl;
+		c->valid = true;
+		*start = s;
+		*end = e;
+		return 0;
+	}
+}
+
+/* line_start() and line_end() through the cache. */
+static int lc_start(struct lcache *c, uint64_t off, uint64_t *out)
+{
+	uint64_t ignore;
+
+	return lcache_at(c, off, out, &ignore);
+}
+
+static int lc_end(struct lcache *c, uint64_t off, uint64_t *out)
+{
+	uint64_t ignore;
+
+	return lcache_at(c, off, &ignore, out);
+}
+
+/*
  * Turn one byte range that differs into line ranges: snap it out to whole
  * lines and let the line diff refine it.  Returns 0, or -1 with errno set --
  * EIO meaning part of the range could not be read, which the caller reports
  * as an unreadable region rather than dying on.
+ *
+ * The two caches belong to the caller, one per file, and are only useful
+ * because the deltas arrive in ascending order (see struct lcache).
  */
 static int range_to_bedits(struct beditlist *bl, int fd_a, int fd_b,
-			   const struct extmap *ma, const struct extmap *mb,
+			   struct lcache *ca, struct lcache *cb,
 			   uint64_t a_off, uint64_t a_len,
 			   uint64_t b_off, uint64_t b_len)
 {
@@ -653,10 +755,10 @@ static int range_to_bedits(struct beditlist *bl, int fd_a, int fd_b,
 	struct editlist el;
 	size_t k;
 
-	if (line_start(fd_a, a_off, &e.a_off) < 0 ||
-	    line_end(fd_a, a_off + a_len, ma->size, &e.a_end) < 0 ||
-	    line_start(fd_b, b_off, &e.b_off) < 0 ||
-	    line_end(fd_b, b_off + b_len, mb->size, &e.b_end) < 0)
+	if (lc_start(ca, a_off, &e.a_off) < 0 ||
+	    lc_end(ca, a_off + a_len, &e.a_end) < 0 ||
+	    lc_start(cb, b_off, &e.b_off) < 0 ||
+	    lc_end(cb, b_off + b_len, &e.b_end) < 0)
 		return -1;
 
 	/*
@@ -725,6 +827,7 @@ int emit_text_diff(const char *path_a, const char *path_b, int fd_a, int fd_b,
 {
 	struct beditlist bl;
 	struct lcounter ca, cb;
+	struct lcache lca, lcb;
 	struct range { uint64_t off, end; } *bad = NULL;
 	size_t nbad = 0, cap_bad = 0;
 	char *touches = NULL;
@@ -738,6 +841,13 @@ int emit_text_diff(const char *path_a, const char *path_b, int fd_a, int fd_b,
 	memset(&cb, 0, sizeof cb);
 	ca.fd = fd_a;
 	cb.fd = fd_b;
+	memset(&lca, 0, sizeof lca);		/* line-boundary caches, not the
+						 * newline counters above */
+	memset(&lcb, 0, sizeof lcb);
+	lca.fd = fd_a;
+	lca.size = ma->size;
+	lcb.fd = fd_b;
+	lcb.size = mb->size;
 
 	if (dl->n == 0)
 		return 0;
@@ -799,8 +909,8 @@ int emit_text_diff(const char *path_a, const char *path_b, int fd_a, int fd_b,
 		if (touches[i])
 			continue;         /* reported in bytes, below */
 
-		rc2 = range_to_bedits(&bl, fd_a, fd_b, ma, mb, d->a_off, d->a_len,
-				      d->b_off, d->b_len);
+		rc2 = range_to_bedits(&bl, fd_a, fd_b, &lca, &lcb, d->a_off,
+				      d->a_len, d->b_off, d->b_len);
 		if (rc2 < 0) {
 			if (errno != EIO)
 				goto out;

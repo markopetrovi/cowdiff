@@ -111,6 +111,32 @@ static char *join(const char *dir, const char *name)
 	return p;
 }
 
+/*
+ * The directories being walked, so that a loop -- a symlink pointing at a
+ * directory above it, which stat() happily follows -- is reported rather than
+ * followed until the kernel gives up at forty levels of it.
+ *
+ * One node per level holds both sides of the pair, since either may be the
+ * one that loops, and the chain lives on the C stack: a level is exactly as
+ * long as the recursion that made it.
+ */
+struct level {
+	const struct level *up;
+	dev_t dev_a, dev_b;
+	ino_t ino_a, ino_b;
+};
+
+/* Is either directory one we are already inside? */
+static bool is_ancestor(const struct level *up, const struct stat *sa,
+			const struct stat *sb)
+{
+	for (; up; up = up->up)
+		if ((up->dev_a == sa->st_dev && up->ino_a == sa->st_ino) ||
+		    (up->dev_b == sb->st_dev && up->ino_b == sb->st_ino))
+			return true;
+	return false;
+}
+
 static const char *typename_of(mode_t m)
 {
 	if (S_ISDIR(m))
@@ -130,11 +156,24 @@ static const char *typename_of(mode_t m)
 	return "unknown file type";
 }
 
-static void walk_dir(const char *pa, const char *pb)
+static void walk_dir(const char *pa, const char *pb, const struct level *up)
 {
+	struct level here;
+	struct stat sa, sb;
 	size_t na = 0, nb = 0, i = 0, j = 0;
 	char **la = list_dir(pa, &na);
 	char **lb = list_dir(pb, &nb);
+
+	/* Both sides named, both exist: this level is now an ancestor of
+	 * whatever is walked below it. */
+	if (stat(pa, &sa) == 0 && stat(pb, &sb) == 0) {
+		here.up = up;
+		here.dev_a = sa.st_dev;
+		here.ino_a = sa.st_ino;
+		here.dev_b = sb.st_dev;
+		here.ino_b = sb.st_ino;
+		up = &here;
+	}
 
 	if (!la && !lb)
 		return;		/* both already complained about */
@@ -191,7 +230,17 @@ static void walk_dir(const char *pa, const char *pb)
 					strerror(errno));
 				note(2);
 			} else if (S_ISDIR(sa.st_mode) && S_ISDIR(sb.st_mode)) {
-				walk_dir(fa, fb);
+				if (is_ancestor(up, &sa, &sb)) {
+					/* diff(1) reports the same way and
+					 * gives up on the pair rather than
+					 * descending into it. */
+					fprintf(stderr,
+						"cowdiff: %s: recursive directory loop\n",
+						fa);
+					note(2);
+				} else {
+					walk_dir(fa, fb, up);
+				}
 			} else if (S_ISREG(sa.st_mode) && S_ISREG(sb.st_mode)) {
 				note(compare_files(fa, fb, true));
 			} else {
@@ -215,6 +264,6 @@ static void walk_dir(const char *pa, const char *pb)
 int walk_trees(const char *pa, const char *pb)
 {
 	status = 0;
-	walk_dir(pa, pb);
+	walk_dir(pa, pb, NULL);
 	return status;
 }

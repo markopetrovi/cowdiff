@@ -18,6 +18,7 @@ tests/probe: tests/probe.c
 
 check: all
 	./tests/run.sh
+	python3 tests/extentcheck.py ./cowdiff ./tests/probe
 
 clean:
 	rm -f $(OBJ) cowdiff tests/probe

@@ -158,6 +158,15 @@ printf 'a\nb\nc' > N1b.txt
 cp N1b.txt N1c.txt
 chk "identical, no trailing newline" N1b.txt N1c.txt
 
+# A change whose trailing context reaches an unterminated last line.  The walk
+# that finds the context crosses newlines on the way and then steps onto a
+# line that has none: counting that step as a newline *and* adding the
+# end-of-file correction made the header claim one line more than the body
+# carried, and patch(1) refuses a hunk whose header over-counts.  Wrong from
+# -U2 up, which is why these run through ctx_check below at every size.
+printf '1\n2\n3\n4\n5' > NT1.txt; printf '1\n2\nX\n4\n5' > NT2.txt
+seq 1 20 | head -c -1 > NT3.txt; sed '18s/.*/X/' NT3.txt > NT4.txt
+
 # --- degenerate -------------------------------------------------------------
 : > Z1.txt; : > Z2.txt
 chk "both empty" Z1.txt Z2.txt
@@ -171,28 +180,57 @@ mk B.txt; sed -i '1500i\inserted A\ninserted B\ninserted C' B.txt
 chk "three lines inserted" A.txt B.txt
 
 # --- context lines, matching diff -U ----------------------------------------
-for n in 0 1 2 3 7; do
-	LC_ALL=C diff -U"$n" A.txt B.txt > "$WORK/.expected"
-	"$COW" -U"$n" A.txt B.txt > "$WORK/.actual"
-	if cmp -s "$WORK/.expected" "$WORK/.actual"; then
-		pass=$((pass + 1))
-	else
-		fail=$((fail + 1))
-		echo "FAIL: -U$n context"
-		diff -u "$WORK/.expected" "$WORK/.actual" | head -20
-	fi
-done
+# Every shape runs at every context size: a hunk header is where a line count
+# can be wrong while the body still looks right, and how far the context
+# reaches is exactly what decides that.
+ctx_check() {                          # ctx_check NAME A B
+	local name=$1 A=$2 B=$3 n
+	for n in 0 1 2 3 7; do
+		LC_ALL=C diff -U"$n" "$A" "$B" > "$WORK/.expected"
+		"$COW" -U"$n" "$A" "$B" > "$WORK/.actual"
+		if cmp -s "$WORK/.expected" "$WORK/.actual"; then
+			pass=$((pass + 1))
+		else
+			fail=$((fail + 1))
+			echo "FAIL: -U$n context, $name"
+			diff -u "$WORK/.expected" "$WORK/.actual" | head -20
+		fi
+	done
+}
+ctx_check "one line changed" A.txt B.txt
+ctx_check "unterminated last line" NT1.txt NT2.txt
+ctx_check "unterminated last line, change further in" NT3.txt NT4.txt
 
 # -u asks for the format we always emit and -a is diff's flag for forcing
 # text; both must be accepted rather than refused.  These files differ, so
 # acceptance means status 1, and only status 2 counts as a rejection.
-for opt in -u --unified -a --text; do
+#
+# The bunched forms are in the list because that is how scripts write them:
+# "-rq" is "-r -q" and a diff that refuses it fails on the invocation rather
+# than on the comparison.
+for opt in -u --unified -a --text -rq -qa -qu -qU0 -rU3; do
 	"$COW" "$opt" A.txt B.txt > /dev/null 2>&1
 	rc=$?
 	if [ "$rc" -le 1 ]; then
 		pass=$((pass + 1))
 	else
 		fail=$((fail + 1)); echo "FAIL: $opt rejected (status $rc)"
+	fi
+done
+
+# A context size that is not a number is a mistake, not a zero.  Taking it
+# for zero would print a hunk with no context and say nothing about it, and
+# "-U" followed by a filename is exactly that mistake.
+"$COW" -U 3 A.txt B.txt > /dev/null 2>&1
+[ "$?" -le 1 ] && pass=$((pass + 1)) || {
+	fail=$((fail + 1)); echo "FAIL: -U 3 rejected"; }
+for bad in -Uabc -U3x -U-1; do
+	"$COW" "$bad" A.txt B.txt > /dev/null 2>&1
+	rc=$?
+	if [ "$rc" -eq 2 ]; then
+		pass=$((pass + 1))
+	else
+		fail=$((fail + 1)); echo "FAIL: $bad accepted (status $rc)"
 	fi
 done
 
@@ -224,6 +262,42 @@ else
 	pass=$((pass + 1))
 fi
 
+# A symlink to a directory above itself is a loop, and following it is not
+# merely slow: it descends until the kernel refuses at forty levels, printing
+# an error for each.  diff(1) reports the loop once and gives up on the pair;
+# this must do the same, with the same status.
+rm -rf L1 L2; mkdir -p L1 L2
+echo x > L1/f; echo x > L2/f
+ln -s . L1/self; ln -s . L2/self
+LC_ALL=C diff -r L1 L2 > "$WORK/.expected" 2>&1; want=$?
+"$COW" -r L1 L2 > "$WORK/.actual" 2>&1; got=$?
+loops=$(grep -c 'recursive directory loop' "$WORK/.actual")
+if [ "$want" -eq "$got" ] && [ "$loops" -eq 1 ]; then
+	pass=$((pass + 1))
+else
+	fail=$((fail + 1))
+	echo "FAIL: symlink loop (diff status $want, cowdiff status $got," \
+	     "$loops report(s))"
+	head -3 "$WORK/.actual"
+fi
+
+# --stats describes the file it is printed for.  A running total across a -r
+# walk makes the second file's line claim the first one's bytes as well, and
+# on an unshared pair compared in binary mode the number is exactly the size
+# of the two files -- so a percentage past 100 is a count that has leaked
+# across files.  (Text mode reads more than the files' size on purpose, by
+# the pass its line numbers cost, so it cannot be measured this way.)
+rm -rf ST1 ST2; mkdir -p ST1 ST2
+head -c 200000 /dev/urandom > ST1/f; head -c 200000 /dev/urandom > ST2/f
+over=$("$COW" -r --stats ST1 ST2 2>&1 >/dev/null |
+	awk '/^cowdiff: read/ { p=$0; sub(/.*\(/, "", p); sub(/%.*/, "", p);
+				 if (p+0 > 100.0001) print p }')
+if [ -z "$over" ]; then
+	pass=$((pass + 1))
+else
+	fail=$((fail + 1)); echo "FAIL: --stats reports $over% of a file read"
+fi
+
 # --- byte-offset mode -------------------------------------------------------
 # The bodies must match the line-number form exactly, and every hunk's offsets
 # must point at the content that hunk shows.
@@ -241,6 +315,16 @@ echo "--- byte-offset mode ---"
 if python3 "$ROOT/tests/bytecheck.py" "$COW" \
 	P.txt Q.txt P.txt R.txt P.txt S.txt P.txt V.txt \
 	T1.txt T2.txt U1.txt U2.txt; then
+	pass=$((pass + 1))
+else
+	fail=$((fail + 1))
+fi
+
+# --- what happens once the list of differing regions fills -------------------
+# Its own fixtures are tens of megabytes, which is why it is a script of its
+# own rather than shapes in this one.
+echo "--- delta cap ---"
+if python3 "$ROOT/tests/deltacheck.py" "$COW"; then
 	pass=$((pass + 1))
 else
 	fail=$((fail + 1))
@@ -337,6 +421,16 @@ for pair in "A.txt B.txt" "A.txt A2.txt" "C.txt D.txt" "C.txt E.txt" \
 		echo "FAIL: -q on $1 vs $2: diff says $want, cowdiff says $got"
 	fi
 done
+
+# And -q says nothing at all about files that match, as diff -q does.  The
+# verdict a script reads is the status; a line it was not expecting is one
+# more thing to parse, and the whole point of the flag is that it is quiet.
+"$COW" -q N1b.txt N1c.txt > "$WORK/.actual" 2>&1
+if [ -s "$WORK/.actual" ]; then
+	fail=$((fail + 1)); echo "FAIL: -q is not silent for identical files"
+else
+	pass=$((pass + 1))
+fi
 
 rm -f "$WORK"/.expected "$WORK"/.actual "$WORK"/.err
 echo

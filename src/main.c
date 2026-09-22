@@ -46,6 +46,28 @@ static void usage(FILE *f, const char *argv0)
 		argv0);
 }
 
+/*
+ * Context lines, from -U NUM, --unified=NUM, or a bundle ending in U.
+ *
+ * Strict about the value, as diff is: "-Uabc" is a mistake worth reporting
+ * rather than a silent zero, and a context of one line where ten were meant
+ * is the kind of difference a person does not notice in the output.
+ */
+static int set_context(const char *v)
+{
+	char *end;
+	long n;
+
+	errno = 0;
+	n = strtol(v, &end, 10);
+	if (end == v || *end != '\0' || errno == ERANGE || n < 0 || n > 1000000) {
+		fprintf(stderr, "cowdiff: invalid context length '%s'\n", v);
+		return -1;
+	}
+	text_diff_set_context((int)n);
+	return 0;
+}
+
 static void dump_map(const char *path, const struct extmap *m)
 {
 	size_t i;
@@ -132,13 +154,21 @@ int compare_files(const char *pa, const char *pb, bool in_recursion)
 	memset(&al, 0, sizeof al);
 	memset(&dl, 0, sizeof dl);
 
+	/*
+	 * --stats counts what this file cost, not what the run has cost: with
+	 * -r every file is reported separately, and a running total would make
+	 * the percentage of the bytes read climb past 100.
+	 */
+	cowdiff_bytes_read = 0;
+
 	if (open_map(pa, &ma, &fd_a, &sa) < 0 ||
 	    open_map(pb, &mb, &fd_b, &sb) < 0)
 		goto out;
 
 	/* The same inode twice needs no work and no reads. */
 	if (sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino) {
-		printf("Files %s and %s are identical\n", pa, pb);
+		if (!opt_brief)		/* as diff -q, which says nothing */
+			printf("Files %s and %s are identical\n", pa, pb);
 		rc = 0;
 		goto out;
 	}
@@ -168,8 +198,9 @@ int compare_files(const char *pa, const char *pb, bool in_recursion)
 	}
 
 	if (dl.n == 0) {
-		/* diff -r says nothing about files that match. */
-		if (!in_recursion)
+		/* Neither diff -r nor diff -q says anything about files that
+		 * match. */
+		if (!in_recursion && !opt_brief)
 			printf("Files %s and %s are identical\n", pa, pb);
 		rc = 0;
 		goto stats;
@@ -245,53 +276,101 @@ int main(int argc, char **argv)
 	for (i = 1; i < argc; i++) {
 		const char *a = argv[i];
 
-		if (!strcmp(a, "-h") || !strcmp(a, "--help")) {
-			usage(stdout, argv[0]);
-			return 0;
-		} else if (!strcmp(a, "-q") || !strcmp(a, "--brief")) {
-			opt_brief = true;
-		} else if (!strcmp(a, "--stats")) {
-			opt_stats = true;
-		} else if (!strcmp(a, "--force-binary")) {
-			opt_force_binary = true;
-		} else if (!strcmp(a, "--byte-offsets")) {
-			opt_byte_offsets = true;
-		} else if (!strcmp(a, "-a") || !strcmp(a, "--text")) {
-			opt_force_text = true;
-		} else if (!strcmp(a, "-r") || !strcmp(a, "--recursive")) {
-			opt_recursive = true;
-		} else if (!strcmp(a, "--dump-extents")) {
-			opt_dump = true;
-		} else if (!strcmp(a, "-u") || !strcmp(a, "--unified")) {
-			/*
-			 * Unified is the only format there is, so this asks for
-			 * what already happens.  Accepted rather than refused:
-			 * it is the flag most often passed to diff out of habit,
-			 * and failing on it would be a poor way to be a drop-in.
-			 */
-		} else if (!strncmp(a, "-U", 2) || !strncmp(a, "--unified=", 10)) {
-			const char *v = a[1] == 'U' ? a + 2 : a + 10;
-			long n;
-
-			if (*v == '\0') {
-				if (++i >= argc) {
-					fprintf(stderr,
-						"cowdiff: -U needs a number\n");
+		if (a[0] == '-' && a[1] == '-' && a[2] != '\0') {
+			if (!strcmp(a, "--help")) {
+				usage(stdout, argv[0]);
+				return 0;
+			} else if (!strcmp(a, "--brief")) {
+				opt_brief = true;
+			} else if (!strcmp(a, "--stats")) {
+				opt_stats = true;
+			} else if (!strcmp(a, "--force-binary")) {
+				opt_force_binary = true;
+			} else if (!strcmp(a, "--byte-offsets")) {
+				opt_byte_offsets = true;
+			} else if (!strcmp(a, "--text")) {
+				opt_force_text = true;
+			} else if (!strcmp(a, "--recursive")) {
+				opt_recursive = true;
+			} else if (!strcmp(a, "--dump-extents")) {
+				opt_dump = true;
+			} else if (!strcmp(a, "--unified")) {
+				/*
+				 * Unified is the only format there is, so
+				 * this asks for what already happens.
+				 * Accepted rather than refused: it is the
+				 * flag most often passed to diff out of
+				 * habit, and failing on it would be a poor
+				 * way to be a drop-in.
+				 */
+			} else if (!strncmp(a, "--unified=", 10)) {
+				if (set_context(a + 10) < 0)
 					return 2;
-				}
-				v = argv[i];
-			}
-			n = strtol(v, NULL, 10);
-			if (n < 0 || n > 1000000) {
-				fprintf(stderr, "cowdiff: bad context %s\n", v);
+			} else {
+				fprintf(stderr, "cowdiff: unknown option %s\n", a);
+				usage(stderr, argv[0]);
 				return 2;
 			}
-			text_diff_set_context((int)n);
-		} else if (a[0] == '-' && a[1] != '\0') {
-			fprintf(stderr, "cowdiff: unknown option %s\n", a);
-			usage(stderr, argv[0]);
-			return 2;
-		} else if (!pa) {
+			continue;
+		}
+
+		if (a[0] == '-' && a[1] != '\0') {
+			/*
+			 * Short options, bunched the way diff accepts them --
+			 * "-rq" is how scripts write "-r -q", and refusing it
+			 * would fail on the invocation rather than the
+			 * comparison.  U takes a value: the rest of this
+			 * argument if there is any, the next one otherwise.
+			 */
+			const char *p = a + 1;
+
+			while (*p) {
+				const char *v;
+
+				if (*p != 'U') {
+					switch (*p) {
+					case 'q':
+						opt_brief = true;
+						break;
+					case 'r':
+						opt_recursive = true;
+						break;
+					case 'a':
+						opt_force_text = true;
+						break;
+					case 'u':
+						break;	/* the only format */
+					case 'h':
+						usage(stdout, argv[0]);
+						return 0;
+					default:
+						fprintf(stderr,
+							"cowdiff: unknown option -%c\n",
+							*p);
+						usage(stderr, argv[0]);
+						return 2;
+					}
+					p++;
+					continue;
+				}
+
+				v = p + 1;
+				if (*v == '\0') {
+					if (++i >= argc) {
+						fprintf(stderr,
+							"cowdiff: -U needs a number\n");
+						return 2;
+					}
+					v = argv[i];
+				}
+				if (set_context(v) < 0)
+					return 2;
+				break;		/* the value ended the bunch */
+			}
+			continue;
+		}
+
+		if (!pa) {
 			pa = a;
 		} else if (!pb) {
 			pb = a;

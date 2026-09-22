@@ -811,7 +811,7 @@ int line_start(int fd, uint64_t off, uint64_t *out)
 	return 0;
 }
 
-int line_end(int fd, uint64_t off, uint64_t limit, uint64_t *out)
+int line_end(int fd, uint64_t off, uint64_t limit, uint64_t *out, bool *found)
 {
 	unsigned char buf[4096];
 
@@ -824,11 +824,13 @@ int line_end(int fd, uint64_t off, uint64_t limit, uint64_t *out)
 		for (i = 0; i < (ssize_t)n; i++) {
 			if (buf[i] == '\n') {
 				*out = off + (uint64_t)i + 1;
+				*found = true;
 				return 0;
 			}
 		}
 		off += n;
 	}
 	*out = limit;
+	*found = false;
 	return 0;
 }

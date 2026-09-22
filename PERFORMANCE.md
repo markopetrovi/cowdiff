@@ -71,24 +71,32 @@ Nothing here is about test files. It is the property the tool is built around.
 
 Run before and after every change:
 
-    ./tests/run.sh                                        # 47 checks
-    python3 tests/extentcheck.py ./cowdiff ./tests/probe  # 16 checks
+    make check                                            # both lines below
+    ./tests/run.sh                                        # 75 checks
+    python3 tests/extentcheck.py ./cowdiff ./tests/probe  # 22 checks
 
 - `tests/run.sh` compares text output against GNU diff byte for byte across
-  22 edit shapes, checks `-U0/1/2/3/7` context against `diff -U`, checks `-r`
-  against `diff -ru`, and runs `tests/bytecheck.py` for `--byte-offsets`.
-  Two further checks cover files with no unique lines, where more than one
-  answer is correct and the property tested is instead that the diff applied
-  to A rebuilds B (§9).
+  22 edit shapes (including files whose last line has no newline), checks
+  `-U0/1/2/3/7` context against `diff -U` on three of them, checks `-r`
+  against `diff -ru`, checks that `-q` is as silent as `diff -q` is, that the
+  options diff accepts — including bunched ones like `-rq` — are accepted
+  here, that a symlink loop is reported once instead of followed, and that
+  `--stats` describes one file rather than the run. It runs
+  `tests/bytecheck.py` for `--byte-offsets` and `tests/deltacheck.py` for the
+  coarse fallback. Two further checks cover files with no unique lines, where
+  more than one answer is correct and the property tested is instead that the
+  diff applied to A rebuilds B (§9).
 - `tests/extentcheck.py` covers the paths where the extent map rather than the
   byte comparison decides the answer: compressed extents, a shifted share
-  built with `FICLONERANGE`, punched holes, zeros against a hole, inline
-  extents, unwritten extents. Fixtures that cannot be built on the filesystem
-  in use **skip loudly** rather than passing quietly — a test that silently
-  stops testing its named path is worse than no test.
+  built with `FICLONERANGE`, punched holes, zeros against a hole, a hole
+  followed by data, inline extents, unwritten extents. Fixtures that cannot be
+  built on the filesystem in use **skip loudly** rather than passing quietly —
+  a test that silently stops testing its named path is worse than no test.
 - **A new test must be checked against the binary it is meant to catch.** Both
   of the §9 tests were run against the previous binary first; the first
   version of one of them passed against it, and was not testing anything.
+  Every test added for §15 was run the same way, and the count of failures it
+  is expected to produce is written down with it.
 
 `tests/bytecheck.py` asserts the two things that matter for `--byte-offsets`:
 the body is identical to the line-number form, and each hunk's offsets point
@@ -129,6 +137,8 @@ identical files cost the same as they always did, and twice as fast as
 
 Already done, newest first:
 
+    e33d557  Two things the review of 019907e turned up
+    3855ed7  Order the notes properly
     e5723a9  Document what happens when a block cannot be read
     019907e  Carry on when a block cannot be read
     a8a4502  Add a license, and point at the notes from the README
@@ -389,12 +399,16 @@ has ever been pushed; this is a local repository only.
 
 ## 13. Not done
 
-- There is no randomized testing. The 47 checks in `tests/run.sh` are
-  hand-built shapes, and §9's bug — the worst one found so far — lived in a
-  fallback path that no hand-built shape exercised. A differential fuzz
-  against GNU diff, using "applying the output to A rebuilds B" as the
-  oracle rather than a byte-for-byte match, is the obvious next thing to
-  build.
+- There is no randomized testing *in the repository*. One was written for the
+  session that found §15's bugs, and it paid for itself inside a few hundred
+  cases: two of the four it found broke §2. It ran four oracles — `-q`
+  returning 0 must mean the bytes are equal, the `-U3` output applied to A
+  must rebuild B, the exit status must agree with `diff`, and every differing
+  byte must lie in a reported region — over shapes built to vary line
+  structure, sharing, sparseness and newline-at-EOF. The scripts were scratch
+  and are not in the tree; what they found is now covered by named regression
+  tests (see §15), and rebuilding the fuzz to look for the *next* one is still
+  the highest-value thing on this list.
 - The `GROUP_MAX` cap in `classes_assign` has never run. Reaching it needs 64
   distinct lines sharing one 32-bit fingerprint, which is not reachable by
   accident and would take a crafted file.
@@ -443,3 +457,134 @@ worth knowing:
 
 `COWDIFF_EIO_AT="offset:length"` makes reads fail on demand, which is how the
 suite tests this without a damaged disk; nothing else sets it.
+
+## 15. Four bugs, and five smaller ones
+
+Two of these four came straight out of the differential fuzz §13 kept asking
+for, in its first few hundred cases, and both of them broke §2: "identical"
+was returned when it was not provable from what the kernel said, or from
+anything else. The other two came from reading and measuring what the fuzz was
+*not* reaching — a delta list that only fills on files of eight megabytes and
+up, and a text path whose cost only appears on files with no newlines in them.
+
+Every fix below has a regression test in the gate (§3), and each of those
+tests was run against the binary *before* its fix as well as after.
+
+### 15.1 A hole was taken for zeros all the way to the end of the gap
+
+`gap_equal_range()` cuts a gap into pieces at every extent boundary, so that
+each piece has one settled answer on each side. It took the boundary from the
+extent *containing* the offset — and when there was none, because the offset
+fell in a hole, it took no boundary at all. The hole was therefore treated as
+running to the end of the gap, and real data on the far side of it sat inside
+a piece whose answer had already been decided to be zeros. Nothing ever read
+it.
+
+    X: 65536-byte hole, then 4096 bytes of 'A'
+    Y: 69632-byte hole
+    $ diff -q X Y       -> differ
+    $ cowdiff --stats X Y
+    cowdiff: read 0 of 139264 bytes (0.0000%)
+    Files X and Y are identical        <- exit 0, nothing read
+
+"Could not be more wrong" is literal: the tool exists so that this verdict is
+provable, and this one was produced by not looking. It needed only that a hole
+end inside the range being decided — which is what a sparse file *is*, and the
+tool's own origin story (§14) is a pair of disk images.
+
+`extmap_next_start()` (new) answers where a hole ends; `extmap_at()` cannot,
+because a hole is precisely the absence of an extent. Both sides are now cut
+at the end of their zero run. `range_is_zero()`, which had the same assumption
+in its own loop, was fixed with it — unreachable from its one caller today,
+but the same mistake waiting for a second caller.
+
+### 15.2 A hunk header claimed one line more than its body carried
+
+A hunk's trailing context is found by stepping forward line by line, and the
+lines it covers are added to the newline count taken before the walk. But the
+last line of a file need not end in a newline: a walk that stops there has
+entered a line without crossing one. `forward_lines()` counted steps, the
+caller added the end-of-file correction as well, and a hunk whose context
+reached an unterminated last line came out one line too long.
+
+    A = "1\n2\n3\n4\n5"   (no trailing newline)
+    B = "1\n2\nX\n4\n5"
+    $ diff -u A B | grep @@      ->  @@ -1,5 +1,5 @@
+    $ cowdiff  A B | grep @@     ->  @@ -1,6 +1,6 @@
+
+The body was right, so comparisons against GNU diff that looked only at
+content passed; the suite did compare headers, but only on shapes whose last
+line had a newline. It was wrong from `-U2` up, and `patch(1)` refuses the
+result outright ("malformed patch") — so the output was not merely mismatched,
+it was unusable.
+
+`line_end()` now reports whether it found a newline or ran out of file, and
+`forward_lines()` counts newlines crossed rather than lines entered, so the
+"+1 for an unterminated final line" lands exactly once whichever way the walk
+ends.
+
+### 15.3 Once the delta list filled, the same bytes were reported over and over
+
+`DELTA_MAX` exists so that two unrelated large files do not report a delta per
+run of differing bytes. Past it the rest of the span is reported as one
+substitution — but the check sat at the top of `diff_buffers()`, which is
+called once per *read chunk*, and the substitution covered everything to the
+end of the span. So chunk after chunk pushed another one, each covering more
+of the same bytes:
+
+    12 MB pair differing in one byte per 32 (393216 bytes truly differ)
+    before:  262148 differing regions (10747904 bytes in A, 10747904 bytes in B)
+    after:   262145 differing regions ( 4456448 bytes in A,  4456448 bytes in B)
+
+"10747904 bytes in" a 12582912-byte file is not an answer anyone can use. On a
+filesystem whose extents are contiguous the repeated substitutions merged into
+one and only the totals gave it away; with larger extents they overlapped and
+the regions themselves were nonsense.
+
+`diff_buffers()` now returns `DIFF_COARSE` once it has reported the rest of
+the span, `compare_range()` stops reading that piece, and `gap_equal_range()`
+moves to the *next piece* rather than to the next gap — every byte not proven
+equal still has to land in some delta. It also stops comparing after the cap,
+which is the point of having one.
+
+### 15.4 Line boundaries were re-read for every delta
+
+Each delta snapped its byte range out to whole lines by asking where the line
+starts and ends, and each question walked to the nearest newline on its own.
+With ordinary lines that is a few bytes; with a file that has no newlines in
+it at all — minified JSON, CR-only line endings, any single-line file — each
+question walks to the end of the file, once per delta.
+
+    1 MB, one differing byte per 64, no newlines
+    before:  19.8 s   (8.4M pread calls, from strace -c)
+    after:    0.00 s
+
+The 16 MB version never finished. `struct lcache` keeps the last line found,
+per file: a question about an offset on that line is free, and a question
+about an offset elsewhere is asked the ordinary way and seeds the cache with
+*its* line. An edit-dense file therefore stops paying for its line lengths, an
+edit-sparse one pays what it did before (measured: within 2% on the benchmark
+shapes), and neither gets a wrong answer to save time.
+
+### 15.5 The smaller things, all in the same pass
+
+- **`--stats` counted the run, not the file.** With `-r` the second file's
+  line included the first file's bytes and printed a percentage past 100 —
+  358% on a two-file walk. `compare_files()` now resets the counter.
+- **Bunched short options were refused.** `diff -rq` works, so this must too,
+  or a script fails on the invocation rather than on the comparison.
+- **`-U` took any garbage for a number.** `-Uabc` silently meant no context —
+  a hunk with no context, and no complaint about it; `-U` followed by a
+  filename meant the same. The value is now digits or an error, as in diff.
+- **`-q` was not quiet.** It printed the "identical" line where `diff -q`
+  prints nothing. The flag's whole value is that a script can read the status
+  and nothing else.
+- **A symlink loop was followed.** A symlink to a directory above itself made
+  the walk descend until the kernel refused at forty levels, printing an error
+  per level. diff(1) reports "recursive directory loop" once and gives up on
+  the pair; so does this now, with the same status.
+
+One thing deliberately left alone: `-r` still has no `--` (end of options), so
+a file whose name begins with `-` cannot be named. It is the only remaining
+case where an argument diff accepts is refused, and it is a small addition if
+anyone needs it.

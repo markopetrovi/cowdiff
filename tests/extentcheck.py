@@ -133,9 +133,16 @@ def filefrag_flags(path):
     address, while cowdiff asks the kernel with FIEMAP_FLAG_SYNC and sees
     the real extent.  Two views of the same file only agree once both are
     looking at what is actually on disk.
+
+    filefrag is e2fsprogs, not part of a minimal system, so a machine
+    without it skips the cases that need a second opinion rather than
+    failing them: nothing is wrong with the binary in that case.
     """
-    r = subprocess.run(["filefrag", "-s", "-v", path], capture_output=True,
-                       text=True)
+    try:
+        r = subprocess.run(["filefrag", "-s", "-v", path], capture_output=True,
+                           text=True)
+    except FileNotFoundError:
+        raise Skip("filefrag is not installed")
     flags = set()
     for line in r.stdout.splitlines():
         parts = line.split(":")
@@ -304,6 +311,68 @@ def case_zeros_vs_hole():
           out.decode(errors="replace"))
 
 
+def case_hole_then_data():
+    """A hole ends where the next extent begins -- not at the end of the range.
+
+    One side is a hole to the end of the file; the other has a hole of the
+    same length and real data after it.  Treating the hole as zeros "from here
+    on" puts that data inside a piece whose answer was already decided, so
+    every byte of the difference was skipped and the pair came out identical.
+    That is the one direction of error this tool must never make.
+    """
+    name = "hole followed by data"
+    a, b = fx("hd_a.bin"), fx("hd_b.bin")
+    hole, tail = 65536, 4096
+
+    with open(a, "wb") as f:
+        f.truncate(hole)                # never written: a hole
+        f.seek(hole)
+        f.write(b"A" * tail)            # real data straight after it
+    with open(b, "wb") as f:
+        f.truncate(hole + tail)         # all hole: reads as zeros
+
+    # If the filesystem stored the data as a hole, or left an extent over the
+    # hole, the comparison being made is a different one and this case would
+    # not be testing its named path.
+    if not any(e["off"] == hole for e in extents(a)):
+        raise Skip("the data after the hole was not stored as its own extent")
+    if any(e["off"] < hole for e in extents(b)):
+        raise Skip("B's hole was stored as an extent")
+
+    rc, out, err = cow("--force-binary", a, b)
+    check("%s: not reported identical" % name, rc == 1, out)
+    sound(name, a, b, parse_regions(out))
+
+
+def case_hole_then_zeros():
+    """The zero test stops where the hole does.
+
+    Both sides start with a hole of the same length; one has data after it and
+    the other a real extent of zeros.  "Both read as zeros" is true of the
+    hole and false of what follows it, so a piece that spans the boundary
+    decides the data's answer with the hole's.
+    """
+    name = "hole then data against hole then zeros"
+    a, b = fx("hz_a.bin"), fx("hz_b.bin")
+    hole, tail = 65536, 4096
+
+    with open(a, "wb") as f:
+        f.truncate(hole)
+        f.seek(hole)
+        f.write(b"A" * tail)
+    with open(b, "wb") as f:
+        f.truncate(hole)
+        f.seek(hole)
+        f.write(b"\0" * tail)
+
+    if any(e["off"] < hole for e in extents(a) + extents(b)):
+        raise Skip("a hole was stored as an extent")
+
+    rc, out, err = cow("--force-binary", a, b)
+    check("%s: not reported identical" % name, rc == 1, out)
+    sound(name, a, b, parse_regions(out))
+
+
 def case_inline():
     """A file small enough to live in its inode is reported with fe_physical
     of zero.  Trusting that address would make two different small files look
@@ -367,7 +436,8 @@ def case_unwritten():
 
 
 CASES = [case_compressed, case_shifted_share, case_hole_punch,
-         case_zeros_vs_hole, case_inline, case_unwritten]
+         case_zeros_vs_hole, case_hole_then_data, case_hole_then_zeros,
+         case_inline, case_unwritten]
 
 
 def main():

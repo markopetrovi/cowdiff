@@ -64,7 +64,20 @@ int extmap_load(struct extmap *m, int fd, uint64_t size);
 /* Extent containing `off`, or NULL if that offset falls in a hole. */
 const struct ext *extmap_at(const struct extmap *m, uint64_t off);
 
-/* Every byte this process has actually read, for --stats. */
+/*
+ * Start of the first extent strictly after `off`, or the file size when there
+ * is none.  A hole is not an extent, so `extmap_at` cannot say where one
+ * *ends* -- and a hole ends exactly here.  Anything that treats a hole as
+ * "zeros from here on" needs this: reading on past the next extent's start
+ * would take real data for zeros.
+ */
+uint64_t extmap_next_start(const struct extmap *m, uint64_t off);
+
+/*
+ * Every byte read since the comparison in progress began, for --stats.
+ * compare_files() resets it, so that -r reports what each file cost rather
+ * than a running total that climbs past the size of the file it describes.
+ */
 extern uint64_t cowdiff_bytes_read;
 
 /* Is this extent's address usable as a content identity? */
@@ -291,8 +304,15 @@ int linediff(const struct lineset *a, const struct lineset *b,
 	     struct editlist *out);
 void edits_free(struct editlist *el);
 
-/* Round a byte offset out to the next line boundary in the given file. */
-int line_end(int fd, uint64_t off, uint64_t limit, uint64_t *out);
+/*
+ * Round a byte offset out to the next line boundary in the given file, capped
+ * at `limit`.  `found` reports whether a newline was actually reached: the
+ * last line of a file need not end in one, and a caller that counts lines has
+ * to know whether the boundary it landed on was a newline or the end of the
+ * file -- counting them alike is how a hunk header comes to claim one line
+ * more than its body carries.
+ */
+int line_end(int fd, uint64_t off, uint64_t limit, uint64_t *out, bool *found);
 /* Round a byte offset back to the start of its line. */
 int line_start(int fd, uint64_t off, uint64_t *out);
 /* Lines of context around each hunk, as in diff -U. */

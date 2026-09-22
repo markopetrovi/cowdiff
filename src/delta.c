@@ -29,6 +29,9 @@
  * everywhere, and one delta per run of differing bytes would be millions of
  * entries saying very little; past this point the rest of the gap is reported
  * as a single substitution, which is still true, just coarser.
+ *
+ * That substitution covers everything left, so it is made once per gap --
+ * see the COARSE return in diff_buffers().
  */
 #define DELTA_MAX (1u << 18)
 
@@ -176,12 +179,18 @@ static int deltas_push_unreadable(struct deltalist *dl, uint64_t a_off,
 	return deltas_push_flags(dl, a_off, a_len, b_off, b_len, unreadable);
 }
 
+/* Returned by diff_buffers when the list filled up and the rest of the span
+ * has been reported as one coarse substitution.  Nothing of that span is left
+ * to refine, so the caller can stop reading it. */
+#define DIFF_COARSE 2
+
 /*
  * Record the runs that differ between two buffers already in memory.
  * `p` is the absolute offset the buffers start at and `n` their length;
  * `left` is how much of the span remains, which is what a delta that has to
  * give up (deltas_full) covers.  Returns 0, 1 having stopped because `stop`
- * was set and a difference was recorded, or -1 on error.
+ * was set and a difference was recorded, DIFF_COARSE having reported the rest
+ * of the span coarsely, or -1 on error.
  */
 static int diff_buffers(const unsigned char *ba, const unsigned char *bb,
 			uint64_t p, size_t n, struct deltalist *out, bool stop,
@@ -193,9 +202,19 @@ static int diff_buffers(const unsigned char *ba, const unsigned char *bb,
 		return 0;
 
 	if (deltas_full(out)) {
+		/*
+		 * The coarse substitution covers everything from here to the end
+		 * of the span, so it may only be made once per span.  Making it
+		 * per read chunk instead reported the same bytes over and over:
+		 * the regions overlapped, and on a single-extent file their
+		 * lengths summed to more bytes than the file has.
+		 *
+		 * `stop` cannot be set here: with it the walk ends at the first
+		 * difference it proves, so the list never fills.
+		 */
 		if (deltas_push(out, p, left, p, left) < 0)
 			return -1;
-		return stop ? 1 : 0;
+		return DIFF_COARSE;
 	}
 
 	while (i < n) {
@@ -334,10 +353,26 @@ static int gap_equal_range(int fd_a, const struct extmap *ma,
 		bool zb = !eb || eb->zero;
 		uint64_t next = end_all;
 
-		if (ea && ea->off + ea->len < next)
-			next = ea->off + ea->len;
-		if (eb && eb->off + eb->len < next)
-			next = eb->off + eb->len;
+		/*
+		 * Where the zeros on each side stop, which is what makes the
+		 * settled answer settled.  An extent ends at its own end; a hole
+		 * ends where the *next* extent begins.  Cutting only at extrinsic
+		 * ends leaves a hole running to the end of the range, and then data
+		 * that follows the hole is inside a piece whose answer was already
+		 * decided to be zeros -- which would report two different files as
+		 * identical.  That is the one error this tool must never make.
+		 */
+		{
+			uint64_t ea_end = ea ? ea->off + ea->len
+					     : extmap_next_start(ma, p);
+			uint64_t eb_end = eb ? eb->off + eb->len
+					     : extmap_next_start(mb, p);
+
+			if (ea_end < next)
+				next = ea_end;
+			if (eb_end < next)
+				next = eb_end;
+		}
 		if (next <= p)
 			next = end_all;
 
@@ -376,8 +411,17 @@ static int gap_equal_range(int fd_a, const struct extmap *ma,
 		} else {
 			rc = compare_range(fd_a, fd_b, p, next - p, ba, bb, cap,
 					   out, stop);
-			if (rc != 0)
+			if (rc < 0)
 				return rc;
+			if (rc == 1)
+				return 1;	/* one difference is enough */
+			/*
+			 * rc == DIFF_COARSE: what is left of this piece has
+			 * been reported as one substitution, so there is nothing
+			 * more to refine here.  The pieces after it are still
+			 * separate questions and still get asked -- everything
+			 * not proven equal has to end up in some delta.
+			 */
 		}
 
 		p = next;

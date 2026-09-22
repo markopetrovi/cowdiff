@@ -127,6 +127,22 @@ const struct ext *extmap_at(const struct extmap *m, uint64_t off)
 	return NULL;
 }
 
+uint64_t extmap_next_start(const struct extmap *m, uint64_t off)
+{
+	size_t lo = 0, hi = m->n;
+
+	while (lo < hi) {
+		size_t mid = lo + (hi - lo) / 2;
+
+		if (m->v[mid].off <= off)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	/* Past the last extent is a hole that runs to the end of the file. */
+	return lo < m->n ? m->v[lo].off : m->size;
+}
+
 /* ---- discovery -------------------------------------------------------- */
 
 #define FIEMAP_BATCH 256
@@ -448,10 +464,15 @@ int range_is_zero(int fd, const struct extmap *m, uint64_t off, uint64_t len,
 		/*
 		 * A hole reads as zeros, and so does an unwritten extent --
 		 * which is exactly why unwritten extents are not treated as
-		 * content identities.  Neither needs to be read.
+		 * content identities.  Neither needs to be read, but *only as far
+		 * as it goes*: a hole ends where the next extent starts, and
+		 * skipping to the end of the requested range instead would call
+		 * that extent's data zeros.
 		 */
 		if (!e || e->zero) {
-			uint64_t skip = e ? e->off + e->len - off : len;
+			uint64_t stop = e ? e->off + e->len
+					  : extmap_next_start(m, off);
+			uint64_t skip = stop > off ? stop - off : len;
 
 			if (skip > chunk)
 				skip = chunk;
