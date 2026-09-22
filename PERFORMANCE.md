@@ -178,31 +178,18 @@ should measure it again first: four of the six shared shapes agreed to within a
 few percent when the two tables were compared, and two had drifted far enough
 that the difference cannot be attributed without a fresh run.
 
-**The build flags are worth 15-30% on six of the eight shapes**, measured
-paired with `tests/measure.py --against` when the default `CFLAGS` moved to
-`-O3 -march=native` (medians of 5 and of 3 runs; `.bench/` has to exist, which
-`tests/bench.sh` builds).  Each flag carries part of it: holding `-march=native`
-and moving `-O2` to `-O3` gives 0.69-0.95 across the shapes, and holding `-O3`
-and adding `-march=native` gives 0.76-1.0.  Rows in the 0.93-1.0 range are
-inside the spread of samples this size and are not effects — one shape read as
-a 4.5% regression against `-O2` and is not one, which is §5's warning about
-single comparisons happening in miniature.  The two that `-march=native` pays
-most for are `scattered changes` (0.76) and `reflink + one change` (0.81), so
-dropping it for portability gives that back; the Makefile has an `install`
-target, and a binary built with it will not run on a CPU without this one's
-instructions.  `-march=x86-64-v3` or nothing at all is the trade for anyone
-shipping further than this machine.
-
-**`-flto` measured as a wash, and kept for what it saves rather than for
-speed.**  Paired medians of 5 runs across the eight shapes, then 25 pairs on
-the three that looked interesting: 1.02, 1.00 and 0.95, every spread
-overlapping 1.0.  It buys 5 KB of binary — 61,152 against 66,368 — and no
-measurable time; it costs about 1.1s of build against 0.12s, and merges 25 of
-66 functions into their callers, which is the ground §5's perf recipes stand
-on.  Neither side of that is large, so it stays.  What had to be checked was
-that it changes no answer: clean under `-Werror`, the gate passes, and 208
-comparisons over 26 fixtures and eight modes, plus the `EIO` ranges and an `-r`
-walk, are byte-identical to the build without it.
+**The build flags are worth measuring too**, paired with
+`tests/measure.py --against`: `-O3 -march=native` is 15-30% better than `-O2`
+on six of the eight shapes, with each flag carrying part of that.  The two
+`-march=native` pays most for are `scattered changes` (0.76) and `reflink + one
+change` (0.81) — a few percent either way on both, as everywhere in this
+section — so dropping it for portability gives that back, and a binary built
+with it will not run on a CPU without this one's instructions: `-march=x86-64-v3`
+or nothing is the trade for shipping it past this machine.  `-flto` measured as
+a wash — medians 1.02, 1.00 and 0.95, spreads overlapping 1.0 — and is kept for
+the 5 KB it saves (61,152 against 66,368) at 1.1s of build against 0.12s, having
+been checked to change no answer: byte-identical output on every fixture, gate
+passing.
 
 ## 5. Method — read this before touching performance
 
@@ -694,12 +681,11 @@ coarser than the best one, it is wrong — and one is easy to build:
     cowdiff -q A B -> "Files A and B differ", exit 1, having read 0 bytes
 
 The intersection can pair A's first block with B's *second* and the other way
-round, so every chain on offer is shifted and both gaps it leaves are
-one-sided. Randomised crossed layouts got it wrong in 153 of 250 cases; a
-text-file variant printed a 395-line diff for two identical files. It fails in
-the direction §2 permits, which is why the invariant held and the audit did not
-look there — but a wrong exit status is a wrong answer, and this one was
-produced by *not looking*, which is the one thing §5 says never to do.
+round, so every chain on offer is shifted and both gaps it leaves are one-sided.
+Randomised crossed layouts got it wrong in 153 of 250 cases, and a text-file
+variant printed a 395-line diff for two identical files.  It fails in the
+direction §2 permits, which is why the invariant held — but a wrong exit status
+is a wrong answer, and this one was reached by *not looking*.
 
 **The fix is at the top, not in the gap.** `anchors_keep_same_offset()` drops
 every match whose two ranges sit at different file offsets, and is called when
@@ -746,13 +732,12 @@ says why it is right for `stop`.
 
 **Nothing in §4 changed.** Those shapes are either unshared, or a reflink
 edited in place or a snapshot, which are all matches at identical offsets, so
-no benchmark shape reaches either change. What changed is one layout that used
+no benchmark shape reaches either change.  What changed is one layout that used
 to answer in 0.00s without reading and now reads: same length, shares crossed.
 On damaged media that answer is "difference" rather than "identical", and it
 has to be — with crossed shares, equality at the same offsets was never
 provable from the addresses, so there is no read-free "identical" to be had
-there. README's promise that a shared block is never read needed "at the same
-offset" adding to it, in the limits section and in §14 above.
+there.
 
 Building a fixture for either of these has its own traps — what layout the
 filesystem actually gives you, and why `/tmp` is the wrong place to ask — and
@@ -773,4 +758,4 @@ and the fifth is the one that has no test, because the walk only recurses into
 a pair whose two sides the caller has already stat'd and no input reaches it.
 It is kept for the same reason §15.1's `range_is_zero` fix is: the mistake is
 latent, what it would produce is silent, and a second caller is one function
-signature away.  §11 carries it as a constraint, having nowhere better to be.
+signature away.  §11 carries it as a constraint.
