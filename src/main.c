@@ -167,7 +167,12 @@ int compare_files(const char *pa, const char *pb, bool in_recursion)
 
 	/* The same inode twice needs no work and no reads. */
 	if (sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino) {
-		if (!opt_brief)		/* as diff -q, which says nothing */
+		/* Neither -q nor -r says anything about files that match: -q
+		 * because the status is the whole answer, -r because it reports
+		 * only the files that differ.  This path is the one that can
+		 * reach "identical" without comparing, so it is also the one
+		 * that has to check both. */
+		if (!in_recursion && !opt_brief)
 			printf("Files %s and %s are identical\n", pa, pb);
 		rc = 0;
 		goto out;

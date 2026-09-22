@@ -262,6 +262,24 @@ else
 	pass=$((pass + 1))
 fi
 
+# A file that is the same inode on both sides is the one pair -r can settle
+# without reading anything, and that shortcut printed the "are identical" line
+# that -r must not print: diff -ru names only the files that differ.  Hardlinks
+# rather than copies, because cp -r gives the two trees separate inodes and the
+# shortcut is never reached.
+rm -rf H1 H2; mkdir -p H1 H2
+echo same > H1/f; ln H1/f H2/f
+echo one > H1/g; echo two > H2/g
+LC_ALL=C diff -ru H1 H2 > "$WORK/.expected"
+"$COW" -r H1 H2 > "$WORK/.actual"
+if cmp -s "$WORK/.expected" "$WORK/.actual"; then
+	pass=$((pass + 1))
+else
+	fail=$((fail + 1))
+	echo "FAIL: -r reported a pair that shares an inode"
+	diff -u "$WORK/.expected" "$WORK/.actual" | head -10
+fi
+
 # A symlink to a directory above itself is a loop, and following it is not
 # merely slow: it descends until the kernel refuses at forty levels, printing
 # an error for each.  diff(1) reports the loop once and gives up on the pair;
