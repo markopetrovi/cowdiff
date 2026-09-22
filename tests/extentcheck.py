@@ -206,6 +206,28 @@ def sound(name, a, b, regions):
 
 # ---- cases ---------------------------------------------------------------
 
+def block_phys(path, blk):
+    """The physical address of each blk-sized block, or None if unanswerable.
+
+    Addresses are contiguous inside an extent, so a block's address is the
+    extent's plus its offset in it.  A compressed extent reports the length the
+    data will have once decompressed, so that arithmetic would be nonsense
+    there; and a hole is not a share at all.  Either way the caller skips
+    rather than asserting something it cannot know.
+    """
+    es = extents(path)
+    if any("encoded" in e["flags"] for e in es):
+        return None
+    size = os.path.getsize(path)
+    out = []
+    for off in range(0, size, blk):
+        e = next((e for e in es if e["off"] <= off < e["off"] + e["len"]), None)
+        if e is None:
+            return None
+        out.append(e["phys"] + (off - e["off"]))
+    return out
+
+
 def case_compressed():
     """A compressed extent's fe_length is the length the data will have once
     decompressed, so [address, address+length) overstates the space it takes
@@ -267,6 +289,85 @@ def case_shifted_share():
           regions == [(0, 0, x, ins)], regions)
     check("%s: reads nothing at all" % name, b"read 0 of" in err,
           err.decode(errors="replace"))
+
+
+def case_crossed_share():
+    """Shares that sit at *different* offsets in the two files.
+
+    A match found by address proves the two ranges hold equal content; it does
+    not prove those bytes agree at the same offsets, and the same offsets are
+    what the verdict is about.  Cross the shares -- A's first block pointing at
+    B's second, and A's second at B's first -- and every chain available is a
+    shifted one, whose gaps are one-sided "insertions" and are reported as
+    differences *without reading anything*.  Two byte-identical files came out
+    "different", exit 1, having read nothing: a wrong "differ" is the loud
+    direction, but it is still a wrong answer, and it is the one an exit status
+    carries.
+
+    Built by cloning A's two halves into B in the other order.  They have to be
+    written in two calls: one write of both makes the filesystem share the
+    blocks with each other inside A, and then there is nothing to cross.
+    """
+    name = "crossed share (FICLONERANGE at a different offset)"
+    a, b = fx("x_a.bin"), fx("x_b.bin")
+    blk = 4096
+    first, second = os.urandom(blk), os.urandom(blk)
+
+    def build(path, lo, hi):
+        """Two blocks, written separately so they are separate extents."""
+        with open(path, "wb") as f:
+            f.write(lo)
+        with open(path, "ab") as f:
+            f.write(hi)
+
+    def clone(src_off, dst_off):
+        r = subprocess.run([PROBE, "clone", a, b, str(src_off), str(blk),
+                            str(dst_off)], capture_output=True)
+        if r.returncode != 0:
+            raise Skip("FICLONERANGE unavailable: %s"
+                       % r.stderr.decode(errors="replace").strip())
+
+    def cross():
+        """B := A's second block, then A's first."""
+        with open(b, "wb") as f:
+            f.truncate(2 * blk)
+        clone(blk, 0)
+        clone(0, blk)
+
+    build(a, first, first)                  # identical bytes, two blocks
+    cross()
+    pa, pb = block_phys(a, blk), block_phys(b, blk)
+    if pa is None or pb is None or pa[0] == pa[1] or \
+       pa[0] != pb[1] or pa[1] != pb[0]:
+        raise Skip("the filesystem did not lay the blocks out crossed: "
+                   "%s vs %s" % (pa, pb))
+
+    rc, out, err = cow("--force-binary", a, b)
+    check("%s: identical bytes, reported identical" % name, rc == 0,
+          "%s %s" % (rc, out.decode(errors="replace")))
+    rc, out, err = cow("-q", a, b)
+    check("%s: -q is as quiet as diff -q" % name, rc == 0 and not out,
+          (rc, out))
+
+    # The same crossing with blocks that differ: the files really do differ,
+    # and at the same offsets, so the report has to cover that.
+    build(a, first, second)
+    cross()
+    rc, out, err = cow("--force-binary", a, b)
+    check("%s: different blocks are still reported different" % name, rc == 1,
+          rc)
+    sound(name + ", different blocks", a, b, parse_regions(out))
+
+    # Control: the same two blocks cloned at matching offsets.  Nothing is
+    # crossed, nothing is dropped, and the answer must not change.
+    build(a, first, second)
+    with open(b, "wb") as f:
+        f.truncate(2 * blk)
+    clone(0, 0)
+    clone(blk, blk)
+    rc, out, err = cow("--force-binary", a, b)
+    check("%s: matching offsets unchanged" % name, rc == 0,
+          "%s %s" % (rc, out.decode(errors="replace")))
 
 
 def case_hole_punch():
@@ -435,9 +536,9 @@ def case_unwritten():
           got is not None and got <= (2 << 20) + (1 << 16), got)
 
 
-CASES = [case_compressed, case_shifted_share, case_hole_punch,
-         case_zeros_vs_hole, case_hole_then_data, case_hole_then_zeros,
-         case_inline, case_unwritten]
+CASES = [case_compressed, case_shifted_share, case_crossed_share,
+         case_hole_punch, case_zeros_vs_hole, case_hole_then_data,
+         case_hole_then_zeros, case_inline, case_unwritten]
 
 
 def main():

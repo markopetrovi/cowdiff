@@ -139,6 +139,19 @@ void anchors_free(struct anchorlist *al);
 int anchors_find(const struct extmap *a, const struct extmap *b,
 		 bool addresses_comparable, struct anchorlist *out);
 
+/*
+ * Drop every anchor whose two ranges sit at different file offsets, keeping
+ * the ones that prove equality *at the same offsets*.  An anchor at differing
+ * offsets proves the content is equal, not that those bytes agree where they
+ * sit, and it is the same offsets the verdict is about.
+ *
+ * Call this when the two files are the same length, where the length settles
+ * nothing and only a comparison can.  Where the lengths differ the verdict is
+ * free, and a shifted anchor still saves the reads that say *where* the
+ * difference is, so it is worth keeping.
+ */
+void anchors_keep_same_offset(struct anchorlist *al);
+
 /* ---- differences ------------------------------------------------------ */
 
 /*

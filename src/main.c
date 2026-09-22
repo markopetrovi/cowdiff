@@ -191,6 +191,27 @@ int compare_files(const char *pa, const char *pb, bool in_recursion)
 		fprintf(stderr, "cowdiff: out of memory\n");
 		goto out;
 	}
+
+	/*
+	 * A chain is a correct alignment for the gaps it leaves, but a chain of
+	 * matches that sit at *different* file offsets is not evidence that the
+	 * two files are equal: the address proves the content is equal, not
+	 * that those bytes agree where they sit.  With the shares crossed -- A's
+	 * block at one offset shared with B's at another, and vice versa -- the
+	 * only chains available are shifted ones, the gaps they leave are
+	 * one-sided, and deltas_find's insertion/deletion branches report those
+	 * as differences without reading a byte, so two identical files came
+	 * out "different".  Dropping the shifted matches leaves a chain in which
+	 * every gap is at the same offsets on both sides (by induction from
+	 * offset 0: the anchors keep prev_a == prev_b), so every gap is compared
+	 * and those branches cannot be reached at all.
+	 *
+	 * Only when the lengths match.  Where they differ the verdict costs
+	 * nothing to reach, and a shifted match is what saves reading the tail
+	 * of a file that had bytes inserted before it.
+	 */
+	if (sa.st_size == sb.st_size)
+		anchors_keep_same_offset(&al);
 	if (deltas_find(fd_a, &ma, (uint64_t)sa.st_size, fd_b, &mb,
 			(uint64_t)sb.st_size, &al, &dl, opt_brief) < 0) {
 		fprintf(stderr, "cowdiff: %s\n", strerror(errno));

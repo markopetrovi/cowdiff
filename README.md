@@ -36,8 +36,19 @@ take about twenty seconds doing it.
    different offset; that still matches, and the offset delta *is* the
    insertion. Matches are then filtered to a chain that never moves backwards
    in either file. Any such chain is a correct alignment, so the selection can
-   be greedy: a worse choice only means larger gaps to compare, never a wrong
-   answer.
+   be greedy: a worse choice only means larger gaps to compare.
+
+   A chain is not by itself a verdict, and that distinction is one this tool
+   got wrong. A match at differing offsets proves the *content* is equal, not
+   that those bytes agree where they sit — and where they sit is what
+   "identical" means. Two files of the same length whose shares are crossed
+   (A's block at one offset shared with B's at another, and vice versa) can
+   only be chained out of shifted matches, and the gaps such a chain leaves are
+   one-sided insertions, which are reported as differences without being read.
+   So when the two files are the same length, matches at differing offsets are
+   dropped and their ranges compared instead. When the lengths differ the
+   length already settles the verdict, and the shifted matches stay, because
+   they are what saves reading the tail after an insertion.
 
 4. **Gaps.** Whatever is left between anchors. Holes and unwritten extents
    need no read. A hole against data is settled by testing the data side for
@@ -175,7 +186,9 @@ space. Intersecting those ranges invents matches that do not exist, which is
 how this tool once reported a phantom 12 KB insertion plus a 12 KB deletion
 for a 23-byte edit. Compressed extents are therefore matched on
 `(address, length)` together, which names one extent and cannot be faked; file
-offsets may still differ, so shifted anchors survive.
+offsets may still differ, so a compressed extent shared at a different offset
+still matches — and, like any other shifted match, is dropped again when the
+two files are the same length.
 
 **Sharing is lost by ordinary edits.** Editors rewrite through a temp file, or
 rewrite the tail; either way btrfs allocates fresh extents and there is nothing
@@ -183,12 +196,24 @@ to skip. The headline win is snapshots and reflink copies, not edited files.
 An insertion with a re-shared tail is reported without reading the tail, but
 reaching that state takes an explicit `FICLONERANGE`.
 
+**A share that sits at different offsets is compared, not trusted, when the
+two files are the same length.** The same content cloned into different offsets
+in the two files can be aligned two ways — offset for offset, or content for
+content — and only the first answers "are these the same bytes *here*". So the
+crossed matches are dropped and the region between the surrounding matches is
+read and compared; the cost is that region, not the file. Where the lengths
+differ the tool still answers from the addresses alone, which is the case the
+insertion above is about.
+
 **Storage that cannot be read is reported, not skipped.** A block that returns
 EIO cannot be shown to hold equal bytes, so it is reported as a difference —
 and said to be a different *kind* of finding, because nothing was seen to
-differ there. Where the two files point at the same physical extent the block
-is never read at all, so damage underneath it costs nothing and the bytes are
-still proven equal. Two places are coarser than they would otherwise be: a
+differ there. Where the two files point at the same physical extent *at the
+same offset* the block is never read at all, so damage underneath it costs
+nothing and the bytes are still proven equal; a share at differing offsets is
+compared rather than trusted when the lengths match, so damage there is
+reported like any other unreadable region. Two places are coarser than they
+would otherwise be: a
 delta that cannot be line-diffed because a block inside it is unreadable is
 reported as a byte range rather than as lines, and line numbers are given up
 for byte offsets when a newline count crosses an unreadable block. Both are

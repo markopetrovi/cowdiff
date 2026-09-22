@@ -22,6 +22,15 @@ Four oracles, in the order they matter:
     the same offsets are checked this way, since where it aligned *differently*
     offsets there is nothing to compare byte for byte.
 
+The `share` mode needs tests/probe: it builds pairs out of a small pool of
+repeated blocks and clones some of B's blocks from *other* occurrences of the
+same block in A, which is the one thing `cp --reflink` cannot build -- it only
+ever makes matches at identical offsets.  A cross is what made the address
+chain sit at a shifted alignment and produce a wrong verdict, so this mode is
+where that shape is hunted at random rather than only in the named fixtures.
+Where FICLONERANGE is unsupported the clone fails and the case runs as an
+ordinary unshared pair instead.
+
 A case that fails keeps its two files under .testtmp/fuzz/keep/ and prints
 what to run to see it again.  Seeds are the only source of variation, so a
 failure reproduces from its seed:
@@ -75,6 +84,57 @@ def edit_text(rng, lines, alphabet, edits, binary=False):
             else:
                 b += b"\n"
     return bytes(a), bytes(b)
+
+
+def hex_block(rng, blk=4096):
+    """A block of text that will not compress.
+
+    Random hex rather than random bytes: text keeps the patch oracle in play
+    (no NUL byte), and incompressible keeps the extents uncompressed -- a
+    compressed extent is matched on (address, length) together, so a file that
+    compresses stops producing the crossed offsets this mode exists to build.
+    """
+    b = bytearray()
+    while len(b) < blk:
+        b += ("%08x" % rng.getrandbits(32)).encode()
+        b += b"\n"
+    return bytes(b[:blk])
+
+
+def shape_share(rng, pa, pb, probe):
+    """Two files with the same bytes, sharing blocks *across* offsets.
+
+    Blocks come from a pool of one to three contents, so the same content
+    appears at two offsets and B's slot i can be a clone of A's slot j.  Some
+    blocks are left alone, so most pairs end up with both kinds of match.  The
+    files are left identical unless a byte is then changed, which is what puts
+    the comparison path rather than just the verdict under the oracles.
+    """
+    blk = 4096
+    n = rng.randint(2, 5)
+    pool = rng.randint(1, 3)
+    contents = [hex_block(rng) for _ in range(pool)]
+    seq = [rng.randrange(pool) for _ in range(n)]
+    body = b"".join(contents[i] for i in seq)
+
+    with open(pa, "wb") as f:
+        f.write(body)
+    with open(pb, "wb") as f:
+        f.write(body)
+
+    for i in range(n):
+        srcs = [j for j in range(n) if j != i and seq[j] == seq[i]]
+        if srcs and rng.random() < 0.6:
+            subprocess.run([probe, "clone", pa, pb, str(rng.choice(srcs) * blk),
+                            str(blk), str(i * blk)], check=False,
+                           capture_output=True)
+
+    if rng.random() < 0.35:                     # and sometimes make them differ
+        with open(pb, "r+b") as f:
+            f.seek(rng.randrange(len(body)))
+            f.write(b"z")
+
+    return True                                 # equal length, compared in step
 
 
 def shape_sparse(rng):
@@ -192,11 +252,13 @@ def run_case(cow, rng, tag, args):
     """Build one pair, run every oracle that applies to it.  Returns True if
     nothing complained."""
     pa, pb = os.path.join(WORK, "a"), os.path.join(WORK, "b")
-    mode = rng.choice(MODES)
+    mode = rng.choice(args.modes)
     same_offsets = False
     want_a = want_b = None
 
-    if mode == "sparse":
+    if mode == "share":
+        same_offsets = shape_share(rng, pa, pb, args.probe)
+    elif mode == "sparse":
         size, sa, sb = shape_sparse(rng)
         write_spec(pa, sa, size)
         write_spec(pb, sb, size)
@@ -330,6 +392,15 @@ def main():
         print("note: patch(1) is not installed: the text oracle is skipped")
     if not args.diff:
         print("note: diff(1) is not installed: the status oracle is skipped")
+
+    # probe is the only way to build a match that sits at a different offset in
+    # the two files; without it that shape is out of reach and the mode is
+    # dropped rather than quietly testing something else.
+    probe = os.path.join(ROOT, "tests", "probe")
+    args.probe = probe if os.access(probe, os.X_OK) else None
+    if not args.probe:
+        print("note: tests/probe is not built: the share mode is skipped")
+    args.modes = MODES + (["share", "share"] if args.probe else [])
 
     shutil.rmtree(WORK, ignore_errors=True)
     os.makedirs(WORK, exist_ok=True)

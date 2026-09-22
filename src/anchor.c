@@ -15,9 +15,15 @@
  *
  * Finding these is an intersection of two sets of physical ranges, followed
  * by picking a subset that never goes backwards in either file.  Any such
- * subset is a correct alignment; a worse choice only means larger gaps left
- * to compare, never a wrong answer.  That is what makes the greedy selection
- * below safe.
+ * subset is a correct alignment, and a worse choice only means larger gaps
+ * left to compare -- so the greedy selection below is safe for the gaps it
+ * leaves.  It was not safe for the *verdict*, and the claim that it was is
+ * what this file got wrong: a match at differing offsets proves the content
+ * is equal, not that those bytes agree where they sit, and the gaps a shifted
+ * chain leaves are one-sided insertions, which deltas_find reports as
+ * differences without reading anything.  Two files of equal length whose
+ * shares are crossed came out "different".  anchors_keep_same_offset() below
+ * is what removes that case, and its comment says why.
  */
 #include "cowdiff.h"
 
@@ -306,4 +312,16 @@ out:
 	if (rc < 0)
 		anchors_free(out);
 	return rc;
+}
+
+void anchors_keep_same_offset(struct anchorlist *al)
+{
+	size_t i, k = 0;
+
+	for (i = 0; i < al->n; i++) {
+		if (al->v[i].a_off != al->v[i].b_off)
+			continue;
+		al->v[k++] = al->v[i];
+	}
+	al->n = k;
 }
