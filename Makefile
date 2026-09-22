@@ -2,7 +2,7 @@ CC      ?= cc
 # -Werror so that a warning is a broken build rather than a line of output
 # nobody reads; override CFLAGS to get a build without it (the sanitizer and
 # -O0 builds do).
-CFLAGS  ?= -O3 -Wall -Wextra -Werror -std=gnu11 -march=native -mtune=native
+CFLAGS  ?= -O3 -Wall -Wextra -Werror -std=gnu11 -march=native -mtune=native -flto
 PREFIX  ?= /usr/local
 
 SRC = src/main.c src/extmap.c src/anchor.c src/delta.c src/linediff.c \

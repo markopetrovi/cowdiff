@@ -191,6 +191,17 @@ target, and a binary built with it will not run on a CPU without this one's
 instructions.  `-march=x86-64-v3` or nothing at all is the trade for anyone
 shipping further than this machine.
 
+**`-flto` measured as a wash, and kept for what it saves rather than for
+speed.**  Paired medians of 5 runs across the eight shapes, then 25 pairs on
+the three that looked interesting: 1.02, 1.00 and 0.95, every spread
+overlapping 1.0.  It buys 5 KB of binary — 61,152 against 66,368 — and no
+measurable time; it costs about 1.1s of build against 0.12s, and merges 25 of
+66 functions into their callers, which is the ground §5's perf recipes stand
+on.  Neither side of that is large, so it stays.  What had to be checked was
+that it changes no answer: clean under `-Werror`, the gate passes, and 208
+comparisons over 26 fixtures and eight modes, plus the `EIO` ranges and an `-r`
+walk, are byte-identical to the build without it.
+
 ## 5. Method — read this before touching performance
 
 **Profile first. Six separate predictions about where the time went were
