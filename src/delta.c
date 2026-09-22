@@ -243,8 +243,9 @@ static int diff_buffers(const unsigned char *ba, const unsigned char *bb,
 #define EIO_BLOCK 4096
 
 static int compare_chunk_with_holes(int fd_a, int fd_b, uint64_t p, size_t n,
-				    unsigned char *ba, unsigned char *bb,
-				    struct deltalist *out, bool stop)
+				    uint64_t left, unsigned char *ba,
+				    unsigned char *bb, struct deltalist *out,
+				    bool stop)
 {
 	size_t k;
 
@@ -270,7 +271,14 @@ static int compare_chunk_with_holes(int fd_a, int fd_b, uint64_t p, size_t n,
 			continue;
 		}
 
-		rc = diff_buffers(ba, bb, p + k, m, out, stop, m);
+		/*
+		 * `left` is what remains of the *span*, not of this block:
+		 * once the delta list is full, the coarse delta it falls back
+		 * to has to cover everything still to come.  Passing the block
+		 * length here would turn one coarse delta per megabyte into
+		 * one per 4 KB block.
+		 */
+		rc = diff_buffers(ba, bb, p + k, m, out, stop, left - k);
 		if (rc != 0)
 			return rc;
 	}
@@ -292,8 +300,8 @@ static int compare_range(int fd_a, int fd_b, uint64_t off, uint64_t len,
 		    pread_full(fd_b, bb, n, p) < 0) {
 			if (errno != EIO)
 				return -1;
-			rc = compare_chunk_with_holes(fd_a, fd_b, p, n, ba, bb,
-						      out, stop);
+			rc = compare_chunk_with_holes(fd_a, fd_b, p, n, left,
+						      ba, bb, out, stop);
 		} else {
 			rc = diff_buffers(ba, bb, p, n, out, stop, left);
 		}

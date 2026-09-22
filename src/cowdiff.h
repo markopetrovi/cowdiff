@@ -199,11 +199,20 @@ struct iobuf {
 int iobuf_init(struct iobuf *b, size_t cap);
 void iobuf_free(struct iobuf *b);
 
-/* Read exactly len bytes at off; returns 0, or -1 on short read or error. */
+/*
+ * Read exactly len bytes at off; returns 0, or -1 with errno set.  The two
+ * failures are distinguished on purpose, because callers treat them
+ * differently: EIO is storage underneath that cannot be read, a fact about
+ * the files; ERANGE is a range that ran past the end, a bug in this program.
+ */
 int pread_full(int fd, void *buf, size_t len, uint64_t off);
 
-/* Fill buf with len zero bytes' worth of knowledge: read a range and report
- * whether every byte was zero.  Reads in chunks so it never allocates. */
+/*
+ * Fill buf with len zero bytes' worth of knowledge: read a range and report
+ * whether every byte was zero.  Reads in chunks so it never allocates.
+ * Returns 0 with *out set, -1 on error, or 1 if the range could not be read
+ * -- which is not the same as "not zeros": it is unknown either way.
+ */
 int range_is_zero(int fd, const struct extmap *m, uint64_t off, uint64_t len,
 		  struct iobuf *scratch, bool *out);
 
